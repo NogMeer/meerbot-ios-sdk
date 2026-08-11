@@ -1,16 +1,20 @@
 // swift-tools-version:5.9
-// MeerBot iOS SDK — Phase 5 (Plan v2 ADR-003 triple-native).
-// Native iOS SDK с SwiftUI UI + native bridges (APNs, Keychain, App Attest, cert pinning).
+// MeerBot iOS SDK — Swift Package.
 //
-// Public API contract (см. docs/mobile-sdk/api-reference.md) идентичен Android и RN
-// для cross-platform consistency. Изменения контракта требуют синхронной правки во всех трёх SDK.
+// Продуктовая платформа — iOS 15+. macOS 12 объявлен ТОЛЬКО чтобы `swift build`/`swift test`
+// работали на хосте без симулятора (CI + локальный прогон): весь UIKit-специфичный код
+// изолирован в Support/PlatformAppearance.swift. Поддерживаемая площадка — iOS.
+//
+// Публичный API-контракт: docs/mobile-sdk/api-reference.md. Изменения контракта требуют
+// синхронной правки Android/RN SDK.
 
 import PackageDescription
 
 let package = Package(
     name: "MeerBotSDK",
     platforms: [
-        .iOS(.v15) // iOS 15+ для SwiftUI + App Attest
+        .iOS(.v15),
+        .macOS(.v12),
     ],
     products: [
         .library(
@@ -23,12 +27,16 @@ let package = Package(
         .target(
             name: "MeerBotSDK",
             dependencies: [],
-            path: "Sources/MeerBotSDK"
+            path: "Sources/MeerBotSDK",
+            resources: [
+                // App Store (iOS 17+) требует privacy manifest внутри бандла SDK.
+                .copy("PrivacyInfo.xcprivacy")
+            ]
         ),
         .testTarget(
             name: "MeerBotSDKTests",
             dependencies: ["MeerBotSDK"],
             path: "Tests/MeerBotSDKTests"
-        )
+        ),
     ]
 )

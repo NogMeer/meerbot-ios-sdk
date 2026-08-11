@@ -1,6 +1,6 @@
-// MeerBot iOS SDK — Phase 5.b: state machine для ChatView.
-// ObservableObject c сообщениями, режимом разговора, индикатором печати.
-// Идентичный контракт у Kotlin ChatViewModel и RN reducer.
+// MeerBot iOS SDK — состояние экрана чата.
+// ObservableObject с сообщениями, режимом разговора, индикатором печати.
+// Контракт совпадает с Kotlin ChatViewModel и RN reducer.
 
 import Foundation
 import Combine
@@ -19,6 +19,8 @@ public struct ChatMessage: Identifiable, Equatable {
     public let authorName: String?
     public var content: String
     public var streaming: Bool
+    /// Сообщение не доставлено (обрыв сети при отправке) — UI показывает возможность повтора.
+    public var failed: Bool
     public let timestamp: Date
 
     public init(
@@ -28,6 +30,7 @@ public struct ChatMessage: Identifiable, Equatable {
         authorName: String? = nil,
         content: String,
         streaming: Bool = false,
+        failed: Bool = false,
         timestamp: Date = Date()
     ) {
         self.id = id
@@ -36,6 +39,7 @@ public struct ChatMessage: Identifiable, Equatable {
         self.authorName = authorName
         self.content = content
         self.streaming = streaming
+        self.failed = failed
         self.timestamp = timestamp
     }
 }
@@ -49,6 +53,8 @@ public final class ChatStore: ObservableObject {
     @Published public private(set) var draft: String = ""
     @Published public private(set) var sending: Bool = false
     @Published public private(set) var connectionError: String? = nil
+    /// Приветствие канала из handshake — показывается вместо дефолтной пустой заглушки.
+    @Published public private(set) var greeting: String? = nil
 
     public init() {}
 
@@ -64,12 +70,16 @@ public final class ChatStore: ObservableObject {
 
     public func setSending(_ value: Bool) { sending = value }
 
+    public func setGreeting(_ text: String?) { greeting = text }
+
+    @discardableResult
     public func appendUserMessage(_ content: String) -> ChatMessage {
         let msg = ChatMessage(role: "user", content: content)
         messages.append(msg)
         return msg
     }
 
+    @discardableResult
     public func appendAssistantPlaceholder() -> ChatMessage {
         let msg = ChatMessage(role: "assistant", author: "ai", content: "", streaming: true)
         messages.append(msg)
@@ -97,6 +107,27 @@ public final class ChatStore: ObservableObject {
         )
     }
 
+    /// Пометить сообщение недоставленным (обрыв сети) либо снять пометку при повторе.
+    public func setFailed(id: String, _ value: Bool) {
+        guard let idx = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[idx].failed = value
+    }
+
+    public func removeMessage(id: String) {
+        messages.removeAll { $0.id == id }
+    }
+
+    /// Заменить всю ленту (догон истории с сервера после обрыва — сервер источник правды).
+    public func replaceAll(_ items: [ChatMessage]) {
+        messages = items
+    }
+
+    /// Убрать пустой стриминговый плейсхолдер (ответ так и не начался).
+    public func dropEmptyPlaceholder(id: String) {
+        guard let idx = messages.firstIndex(where: { $0.id == id }) else { return }
+        if messages[idx].content.isEmpty { messages.remove(at: idx) }
+    }
+
     public func resetForLogout() {
         messages.removeAll()
         mode = .ai
@@ -104,5 +135,6 @@ public final class ChatStore: ObservableObject {
         draft = ""
         sending = false
         connectionError = nil
+        greeting = nil
     }
 }

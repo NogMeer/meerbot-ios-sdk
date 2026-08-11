@@ -1,23 +1,30 @@
-// MeerBot iOS SDK — Phase 5.b: основной экран чата (SwiftUI).
+// MeerBot iOS SDK — экран чата (SwiftUI).
 //
-// Контракт идентичен Android Compose ChatScreen и RN ChatScreen.
+// View тонкий: всё поведение — в ChatController. Контракт совпадает с Android Compose
+// ChatScreen и RN ChatScreen.
 
 import SwiftUI
 
 public struct ChatView: View {
 
-    @StateObject private var store = ChatStore()
+    @ObservedObject private var controller: ChatController
+    @ObservedObject private var store: ChatStore
     @Environment(\.dismiss) private var dismiss
 
     private let title: String
     private let primaryColor: Color
     private let onClose: (() -> Void)?
 
+    /// - Parameter controller: связка с API. `MeerBot.shared.chatView()` передаёт свой;
+    ///   отдельный контроллер нужен, только если приложение ведёт несколько независимых чатов.
     public init(
+        controller: ChatController,
         title: String = "Поддержка",
         primaryColor: Color = .blue,
         onClose: (() -> Void)? = nil
     ) {
+        self.controller = controller
+        self.store = controller.store
         self.title = title
         self.primaryColor = primaryColor
         self.onClose = onClose
@@ -46,40 +53,22 @@ public struct ChatView: View {
                 .padding(.vertical, 4)
             }
             if let err = store.connectionError {
-                Text(err)
-                    .font(.caption)
-                    .foregroundColor(.red)
-                    .padding(8)
-                    .background(Color.red.opacity(0.1))
+                ConnectionBanner(
+                    text: err,
+                    canRetry: controller.retryableText != nil,
+                    onRetry: { controller.retry() }
+                )
             }
             ChatInput(
                 store: store,
                 primaryColor: primaryColor,
-                onSend: { text in
-                    Task { await sendMessage(text) }
-                }
+                onSend: { controller.send($0) }
             )
         }
-        .background(Color(.systemBackground))
+        .background(Color.mbSurface)
         .accentColor(primaryColor)
-    }
-
-    private func sendMessage(_ text: String) async {
-        await MainActor.run {
-            _ = store.appendUserMessage(text)
-            store.clearDraft()
-            store.setSending(true)
-        }
-        // TODO Phase 5.b polish: реальный вызов APIClient.openChatStream через MeerBot.shared
-        // Здесь — placeholder для демонстрации UI. Реальная интеграция через MeerBot.shared
-        // выполняется в MeerBotSDK.swift configure() → создание APIClient instance.
-        let placeholderId = await MainActor.run { store.appendAssistantPlaceholder() }.id
-        try? await Task.sleep(nanoseconds: 600_000_000)
-        await MainActor.run {
-            store.updateAssistantContent(id: placeholderId, delta: "Это демо-ответ. Реальная интеграция через MeerBot.shared.configure().")
-            store.finalizeAssistant(id: placeholderId)
-            store.setSending(false)
-        }
+        .onAppear { controller.start() }
+        .onDisappear { controller.stop() }
     }
 }
 
@@ -100,7 +89,31 @@ private struct ChatHeader: View {
             .accessibilityLabel("Закрыть чат")
         }
         .padding()
-        .background(Color(.systemBackground))
+        .background(Color.mbSurface)
+    }
+}
+
+private struct ConnectionBanner: View {
+    let text: String
+    let canRetry: Bool
+    let onRetry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(text)
+                .font(.caption)
+                .foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            if canRetry {
+                Button("Повторить", action: onRetry)
+                    .font(.caption.weight(.semibold))
+                    .accessibilityLabel("Повторить отправку")
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.opacity(0.1))
     }
 }
 
@@ -116,10 +129,12 @@ struct MessagesList: View {
                             Image(systemName: "bubble.left.and.bubble.right")
                                 .font(.system(size: 40))
                                 .foregroundColor(.secondary)
-                            Text("Привет! Чем могу помочь?")
+                            Text(store.greeting ?? "Привет! Чем могу помочь?")
+                                .multilineTextAlignment(.center)
                                 .foregroundColor(.secondary)
                         }
                         .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 24)
                         .padding(.top, 40)
                     } else {
                         ForEach(store.messages) { msg in
@@ -155,6 +170,7 @@ struct TypingIndicator: View {
             }
         }
         .onAppear { bounce = true }
+        .accessibilityHidden(true)
     }
 }
 
@@ -165,20 +181,35 @@ struct ChatInput: View {
 
     @State private var localDraft: String = ""
 
-    var body: some View {
-        HStack(spacing: 8) {
+    private var trimmed: String {
+        localDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @ViewBuilder
+    private var textField: some View {
+        if #available(iOS 16.0, macOS 13.0, *) {
             TextField("Сообщение…", text: $localDraft, axis: .vertical)
                 .lineLimit(1...4)
+        } else {
+            TextField("Сообщение…", text: $localDraft)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Многострочный ввод (`axis:`) появился только в iOS 16 — на iOS 15
+            // остаётся однострочное поле, всё остальное поведение то же.
+            textField
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(Color(.secondarySystemBackground))
+                .background(Color.mbSurfaceSecondary)
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .disabled(store.mode == .closed)
             Button(action: {
-                let trimmed = localDraft.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty, !store.sending, store.mode != .closed else { return }
+                let text = trimmed
                 localDraft = ""
-                onSend(trimmed)
+                onSend(text)
             }) {
                 Image(systemName: "paperplane.fill")
                     .padding(8)
@@ -186,10 +217,10 @@ struct ChatInput: View {
                     .foregroundColor(.white)
                     .clipShape(Circle())
             }
-            .disabled(localDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.sending)
+            .disabled(trimmed.isEmpty || store.sending)
             .accessibilityLabel("Отправить")
         }
         .padding(8)
-        .background(Color(.systemBackground))
+        .background(Color.mbSurface)
     }
 }

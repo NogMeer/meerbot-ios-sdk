@@ -1,0 +1,69 @@
+# CI зеркала meerbot-ios-sdk. В монорепозитории agentbot-platform не запускается —
+# файл едет в публичный репозиторий вместе с пакетом через `git subtree split`.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Сборка и тесты
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия Swift
+        run: swift --version
+
+      # Хост-сборка: быстрая, гоняет всю логику (сеть подменяется StubURLProtocol).
+      - name: swift build
+        run: swift build
+
+      - name: swift test
+        run: swift test
+
+      # Продуктовая площадка — iOS. Проверяем, что доступность API не ниже iOS 15.
+      - name: Сборка под iOS Simulator
+        run: |
+          xcodebuild \
+            -scheme MeerBotSDK \
+            -destination 'generic/platform=iOS Simulator' \
+            -quiet \
+            build
+
+  release-guard:
+    name: Проверка тега
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Тег обязан совпадать с версией в коде: иначе клиент поставит 0.2.0,
+      # а X-SDK-Version будет слать 0.1.0, и матрица поддержки поедет.
+      - name: Тег совпадает с MeerBotPlatform.version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          CODE=$(grep -o 'version = "[^"]*"' Sources/MeerBotSDK/MeerBotSDK.swift | head -1 | cut -d'"' -f2)
+          echo "тег=$TAG код=$CODE"
+          if [ "$TAG" != "$CODE" ]; then
+            echo "::error::Тег $TAG не совпадает с MeerBotPlatform.version=$CODE"
+            exit 1
+          fi
+
+      - name: CHANGELOG содержит запись о версии
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          grep -q "## \[$TAG\]" CHANGELOG.md || {
+            echo "::error::В CHANGELOG.md нет раздела ## [$TAG]"
+            exit 1
+          }
