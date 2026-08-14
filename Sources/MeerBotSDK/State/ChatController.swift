@@ -17,6 +17,20 @@ public final class ChatController: ObservableObject {
     /// Текст, который не удалось отправить: UI показывает «Повторить».
     @Published public private(set) var retryableText: String?
 
+    /// Идентификатор текущего диалога, или `nil` пока диалог не заведён (посетитель ещё не
+    /// написал первым, и заводить тред не на что).
+    ///
+    /// Зачем публично: приложение хоста получает пуш «оператор ответил» СВОИМ бэкендом и
+    /// должно уметь его подавить, если этот же диалог сейчас открыт на экране. Без этого
+    /// значения приложение сравнить не с чем, и пользователь получает баннер о сообщении,
+    /// которое видит прямо перед собой.
+    ///
+    /// ⚠️ Значение НЕПРОЗРАЧНО и действительно только в паре с каналом, которым работает
+    /// SDK: у каждого канала своя последовательность id, и на бэкенде они пересекаются.
+    /// Хранить его как «вечный» ключ пользователя нельзя — для адресации на своей стороне
+    /// используйте идентификатор, который передали в identity-токене.
+    @Published public private(set) var conversationId: Int?
+
     private var streamTask: Task<Void, Never>?
     private var startTask: Task<Void, Never>?
 
@@ -36,6 +50,7 @@ public final class ChatController: ObservableObject {
                 self.store.setGreeting(session.greeting)
                 self.store.setMode(session.mode)
                 self.store.setError(nil)
+                self.conversationId = session.conversationId
                 if session.conversationId != nil {
                     try? await self.loadHistory()
                 }
@@ -74,6 +89,7 @@ public final class ChatController: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.client.setConversationId(id)
+            self.conversationId = id
             do {
                 try await self.loadHistory()
                 self.store.setError(nil)
@@ -126,7 +142,11 @@ public final class ChatController: ObservableObject {
 
     private func handle(_ event: ChatStreamEvent, placeholderId: String) {
         switch event {
-        case let .meta(_, mode):
+        case let .meta(id, mode):
+            // Первое сообщение в новом треде: диалог заводит сервер и сообщает его id
+            // именно здесь. До этого события `conversationId` пуст — это не ошибка.
+            // `-1` парсер отдаёт, когда поля в событии не было вовсе (см. ChatStreamEvent).
+            if id > 0 { conversationId = id }
             store.setMode(mode)
 
         case let .contentDelta(text):

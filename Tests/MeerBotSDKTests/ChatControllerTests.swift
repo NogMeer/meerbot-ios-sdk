@@ -195,4 +195,64 @@ final class ChatControllerTests: XCTestCase {
             controller.store.messages.last?.content == "Менеджер ответил"
         }
     }
+
+    // MARK: - conversationId наружу
+
+    // Приложение хоста получает пуш «оператор ответил» своим бэкендом и должно уметь его
+    // подавить, когда этот же диалог открыт на экране. Сравнивать было не с чем: id жил
+    // внутри APIClient и на контроллер не выходил.
+
+    func testДоПервогоСообщенияДиалогаНетИИдентификаторПуст() async throws {
+        stubSession()
+        let controller = makeController()
+        controller.start()
+
+        try await waitUntil("готовности сессии") { controller.isReady }
+        XCTAssertNil(controller.conversationId)
+    }
+
+    func testВосстановленныйСерверомДиалогПоднимаетсяВHandshake() async throws {
+        stubSession(conversationId: 77)
+        StubURLProtocol.enqueue(path: "/api/v1/widget/messages", .json(["messages": []]))
+
+        let controller = makeController()
+        controller.start()
+
+        try await waitUntil("готовности сессии") { controller.isReady }
+        XCTAssertEqual(controller.conversationId, 77)
+    }
+
+    func testНовыйДиалогПоднимаетсяИзСобытияMeta() async throws {
+        stubSession()
+        StubURLProtocol.enqueue(
+            path: "/api/v1/widget/chat/stream",
+            .sse(
+                """
+                event: meta
+                data: {"conversationId":5,"mode":"ai"}
+
+                data: [DONE]
+
+
+                """
+            )
+        )
+
+        let controller = makeController()
+        XCTAssertNil(controller.conversationId)
+        controller.send("привет")
+
+        try await waitUntil("завершения ответа") { !controller.store.sending }
+        XCTAssertEqual(controller.conversationId, 5)
+    }
+
+    func testОткрытиеДиалогаИзПушаОбновляетИдентификатор() async throws {
+        StubURLProtocol.enqueue(path: "/api/v1/widget/messages", .json(["messages": []]))
+
+        let controller = makeController()
+        controller.openConversation(id: 42)
+
+        try await waitUntil("применения диалога") { controller.conversationId == 42 }
+    }
+
 }
