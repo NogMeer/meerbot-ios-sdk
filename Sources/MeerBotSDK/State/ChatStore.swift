@@ -70,6 +70,11 @@ public final class ChatStore: ObservableObject {
 
     public func setSending(_ value: Bool) { sending = value }
 
+    /// Приветствие над пустой лентой.
+    ///
+    /// У мобильного канала СЕРВЕРНОГО источника нет: `ClientMobileApp` не хранит ни названия
+    /// чата, ни приветствия (в отличие от веб-виджета, который отдавал их в handshake).
+    /// Поэтому значение задаёт хост-приложение; не задал — `ChatView` покажет свой дефолт.
     public func setGreeting(_ text: String?) { greeting = text }
 
     @discardableResult

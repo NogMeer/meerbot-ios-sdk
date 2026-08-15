@@ -7,6 +7,10 @@ import XCTest
 @MainActor
 final class ChatControllerTests: XCTestCase {
 
+    private let registerPath = "/api/v1/mobile/register"
+    private let streamPath = "/api/v1/mobile/chat/stream"
+    private let messagesPath = "/api/v1/mobile/messages"
+
     override func setUp() {
         super.setUp()
         StubURLProtocol.reset()
@@ -17,26 +21,32 @@ final class ChatControllerTests: XCTestCase {
             client: APIClient(
                 config: MeerBotConfiguration(
                     apiKey: "pk_live_test",
-                    baseURL: URL(string: "https://meerbot.test")!,
-                    origin: "https://ru.tumanvpn.app"
+                    baseURL: URL(string: "https://meerbot.test")!
                 ),
                 visitorUuid: "11111111-2222-4333-8444-555555555555",
+                installationId: "99999999-8888-4777-8666-555555555555",
                 sessionConfiguration: .stubbed()
             )
         )
     }
 
-    private func stubSession(conversationId: Any = NSNull()) {
+    private func stubRegister() {
         StubURLProtocol.enqueue(
-            path: "/api/v1/widget/session",
+            path: registerPath,
             .json([
-                "sessionId": "s1",
+                "deviceId": "42",
                 "jwt": "jwt-1",
                 "expiresIn": 900,
-                "conversationId": conversationId,
-                "mode": "ai",
-                "widget": ["id": 1, "title": "Поддержка", "greeting": "Чем помочь?"],
-            ], status: 201)
+                "attestationRequired": false,
+                "identity": ["status": "not_provided"],
+            ])
+        )
+    }
+
+    private func stubHistory(_ messages: [[String: Any]] = [], mode: String = "ai") {
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json(["messages": messages, "hasMore": false, "mode": mode])
         )
     }
 
@@ -54,20 +64,62 @@ final class ChatControllerTests: XCTestCase {
         XCTFail("не дождались: \(description)")
     }
 
-    func testПриветствиеКаналаПоднимаетсяИзHandshake() async throws {
-        stubSession()
+    // MARK: Старт
+
+    func testСтартРегистрируетУстройствоИПодтягиваетТред() async throws {
+        stubRegister()
+        stubHistory([
+            ["id": 1, "role": "user", "content": "вчерашний вопрос", "createdAt": "2026-08-15T10:00:00.000Z"],
+            ["id": 2, "role": "assistant", "content": "вчерашний ответ", "createdAt": "2026-08-15T10:00:01.000Z"],
+        ])
+
         let controller = makeController()
         controller.start()
 
         try await waitUntil("готовности сессии") { controller.isReady }
-        XCTAssertEqual(controller.store.greeting, "Чем помочь?")
+        XCTAssertEqual(
+            controller.store.messages.map(\.content),
+            ["вчерашний вопрос", "вчерашний ответ"],
+            "история треда — по устройству, id диалога для этого не нужен"
+        )
         XCTAssertNil(controller.store.connectionError)
     }
 
-    func testОтветСтримитсяВЛентуИЗавершается() async throws {
-        stubSession()
+    /// «Диалог у менеджера» — состояние ТРЕДА, а не свойство сообщений. Не примени мы режим
+    /// при пустой ленте, экран предлагал бы писать боту, который в этом режиме молчит.
+    func testРежимТредаПрименяетсяДажеПриПустойЛенте() async throws {
+        stubRegister()
+        stubHistory([], mode: "human")
+
+        let controller = makeController()
+        controller.start()
+
+        try await waitUntil("готовности сессии") { controller.isReady }
+        XCTAssertEqual(controller.store.mode, .human)
+    }
+
+    func testОтказРегистрацииПоказываетсяПользователюИНеОставляетЭкранГотовым() async throws {
         StubURLProtocol.enqueue(
-            path: "/api/v1/widget/chat/stream",
+            path: registerPath,
+            .json([
+                "error": ["type": "authentication_error", "code": "identity_required", "message": "нужен вход"],
+            ], status: 403)
+        )
+
+        let controller = makeController()
+        controller.start()
+
+        try await waitUntil("баннера ошибки") { controller.store.connectionError != nil }
+        XCTAssertFalse(controller.isReady)
+        XCTAssertEqual(controller.store.connectionError, "Приложение требует входа. Войдите и повторите.")
+    }
+
+    // MARK: Поток
+
+    func testОтветСтримитсяВЛентуИЗавершается() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: streamPath,
             .sse(
                 """
                 event: meta
@@ -94,11 +146,11 @@ final class ChatControllerTests: XCTestCase {
     }
 
     func testОбрывСетиПоказываетОшибкуИПредлагаетПовтор() async throws {
-        stubSession()
+        stubRegister()
         var dropped = StubResponse.sse("data: {\"choices\":[{\"delta\":{\"content\":\"частичный\"}}]}\n\n")
         dropped.failure = URLError(.networkConnectionLost)
         dropped.chunkDelay = 0.05
-        StubURLProtocol.enqueue(path: "/api/v1/widget/chat/stream", dropped)
+        StubURLProtocol.enqueue(path: streamPath, dropped)
 
         let controller = makeController()
         controller.send("привет")
@@ -118,11 +170,11 @@ final class ChatControllerTests: XCTestCase {
     }
 
     func testПовторПослеОбрываДоводитОтветДоКонца() async throws {
-        stubSession()
+        stubRegister()
         var dropped = StubResponse.sse("")
         dropped.failure = URLError(.networkConnectionLost)
         StubURLProtocol.enqueue(
-            path: "/api/v1/widget/chat/stream",
+            path: streamPath,
             dropped,
             .sse("data: {\"choices\":[{\"delta\":{\"content\":\"Готово\"}}]}\n\ndata: [DONE]\n\n")
         )
@@ -141,22 +193,15 @@ final class ChatControllerTests: XCTestCase {
 
     /// Если соединение оборвалось, но сервер успел дописать ответ — состояние берём с сервера.
     func testПослеОбрываЛентаПодтягиваетсяСервернойИсторией() async throws {
-        stubSession()
+        stubRegister()
         var dropped = StubResponse.sse("event: meta\ndata: {\"conversationId\":31,\"mode\":\"ai\"}\n\n")
         dropped.failure = URLError(.networkConnectionLost)
         dropped.chunkDelay = 0.05
-        StubURLProtocol.enqueue(path: "/api/v1/widget/chat/stream", dropped)
-        StubURLProtocol.enqueue(
-            path: "/api/v1/widget/messages",
-            .json([
-                "messages": [
-                    ["id": 1, "role": "user", "content": "привет", "createdAt": "2026-08-11T10:00:00.000Z"],
-                    ["id": 2, "role": "assistant", "content": "Ответ дописан", "createdAt": "2026-08-11T10:00:01.000Z"],
-                ],
-                "hasMore": false,
-                "mode": "ai",
-            ])
-        )
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+        stubHistory([
+            ["id": 1, "role": "user", "content": "привет", "createdAt": "2026-08-15T10:00:00.000Z"],
+            ["id": 2, "role": "assistant", "content": "Ответ дописан", "createdAt": "2026-08-15T10:00:01.000Z"],
+        ])
 
         let controller = makeController()
         controller.send("привет")
@@ -168,64 +213,53 @@ final class ChatControllerTests: XCTestCase {
     }
 
     func testЗакрытыйДиалогНеПринимаетСообщения() async throws {
-        stubSession()
+        stubRegister()
         let controller = makeController()
         controller.store.setMode(.closed)
         controller.send("привет")
 
         XCTAssertTrue(controller.store.messages.isEmpty)
-        XCTAssertTrue(StubURLProtocol.requests(path: "/api/v1/widget/chat/stream").isEmpty)
+        XCTAssertTrue(StubURLProtocol.requests(path: streamPath).isEmpty)
     }
 
-    func testПушОткрываетДиалогИПодтягиваетЕгоИсторию() async throws {
-        stubSession()
-        StubURLProtocol.enqueue(
-            path: "/api/v1/widget/messages",
-            .json([
-                "messages": [["id": 7, "role": "assistant", "content": "Менеджер ответил", "createdAt": "2026-08-11T10:00:00.000Z"]],
-                "hasMore": false,
-                "mode": "human",
-            ])
-        )
+    func testПушПодтягиваетСвежуюЛенту() async throws {
+        stubRegister()
+        stubHistory([
+            ["id": 7, "role": "assistant", "content": "Менеджер ответил", "createdAt": "2026-08-15T10:00:00.000Z"],
+        ], mode: "human")
 
         let controller = makeController()
         controller.openConversation(id: 55)
 
-        try await waitUntil("загрузки истории диалога из пуша") {
+        try await waitUntil("загрузки ленты после пуша") {
             controller.store.messages.last?.content == "Менеджер ответил"
         }
     }
 
     // MARK: - conversationId наружу
 
-    // Приложение хоста получает пуш «оператор ответил» своим бэкендом и должно уметь его
-    // подавить, когда этот же диалог открыт на экране. Сравнивать было не с чем: id жил
-    // внутри APIClient и на контроллер не выходил.
+    // Приложение хоста получает пуш «менеджер ответил» СВОИМ бэкендом (платформа шлёт вебхук,
+    // а не пуш) и должно уметь подавить баннер, когда этот же диалог открыт на экране.
+    // Сравнивать было не с чем: id жил внутри APIClient и на контроллер не выходил.
 
     func testДоПервогоСообщенияДиалогаНетИИдентификаторПуст() async throws {
-        stubSession()
-        let controller = makeController()
-        controller.start()
-
-        try await waitUntil("готовности сессии") { controller.isReady }
-        XCTAssertNil(controller.conversationId)
-    }
-
-    func testВосстановленныйСерверомДиалогПоднимаетсяВHandshake() async throws {
-        stubSession(conversationId: 77)
-        StubURLProtocol.enqueue(path: "/api/v1/widget/messages", .json(["messages": []]))
+        stubRegister()
+        stubHistory()
 
         let controller = makeController()
         controller.start()
 
         try await waitUntil("готовности сессии") { controller.isReady }
-        XCTAssertEqual(controller.conversationId, 77)
+        XCTAssertNil(
+            controller.conversationId,
+            "регистрация про диалог ничего не сообщает — id приходит из meta или из пуша"
+        )
     }
 
     func testНовыйДиалогПоднимаетсяИзСобытияMeta() async throws {
-        stubSession()
+        stubRegister()
         StubURLProtocol.enqueue(
-            path: "/api/v1/widget/chat/stream",
+            path: streamPath,
             .sse(
                 """
                 event: meta
@@ -247,7 +281,8 @@ final class ChatControllerTests: XCTestCase {
     }
 
     func testОткрытиеДиалогаИзПушаОбновляетИдентификатор() async throws {
-        StubURLProtocol.enqueue(path: "/api/v1/widget/messages", .json(["messages": []]))
+        stubRegister()
+        stubHistory()
 
         let controller = makeController()
         controller.openConversation(id: 42)

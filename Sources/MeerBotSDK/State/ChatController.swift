@@ -38,22 +38,21 @@ public final class ChatController: ObservableObject {
         self.client = client
     }
 
-    /// Открыть сессию и подтянуть историю прошлого диалога (если он восстановлен сервером).
+    /// Зарегистрировать устройство и подтянуть историю треда.
     public func start() {
-        // Повторный onAppear не должен выписывать новый JWT: каждый handshake — это ещё один
-        // jti в Redis-allowlist и upsert визитора на сервере.
+        // Повторный onAppear не должен выписывать новый JWT: каждая регистрация — это ещё
+        // один jti в Redis-allowlist и upsert устройства на сервере.
         guard startTask == nil, !isReady else { return }
         startTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let session = try await self.client.openSession()
-                self.store.setGreeting(session.greeting)
-                self.store.setMode(session.mode)
+                _ = try await self.client.openSession()
                 self.store.setError(nil)
-                self.conversationId = session.conversationId
-                if session.conversationId != nil {
-                    try? await self.loadHistory()
-                }
+                // История тянется ВСЕГДА: тред мобильного канала ключуется на устройстве, и
+                // регистрация про существование диалога ничего не сообщает. Пустая лента —
+                // штатный ответ, а не ошибка. Оттуда же приходит режим: кто отвечает
+                // пользователю (`ai` | `human`), знает только серверная строка диалога.
+                try? await self.loadHistory()
                 self.isReady = true
             } catch {
                 self.isReady = false
@@ -84,7 +83,11 @@ public final class ChatController: ObservableObject {
         }
     }
 
-    /// Открыть конкретный диалог (deep link из пуша) и подтянуть его историю.
+    /// Открыть диалог по deep link из пуша.
+    ///
+    /// У мобильного канала тред один и ключуется на устройстве, поэтому «открыть другой
+    /// диалог» здесь означает «подтянуть свежую ленту»: id из пуша только запоминается —
+    /// чтобы приложение могло сверять его с открытым экраном — и в запрос не уходит.
     public func openConversation(id: Int) {
         Task { [weak self] in
             guard let self else { return }
@@ -224,8 +227,14 @@ public final class ChatController: ObservableObject {
     }
 
     /// Догон истории: сервер — источник правды, локальную ленту заменяем целиком.
+    ///
+    /// Режим применяется ДАЖЕ при пустой ленте: «диалог у менеджера» — это состояние треда,
+    /// а не свойство сообщений, и пропусти мы его, экран предлагал бы писать боту, который
+    /// в этом режиме молчит.
     private func loadHistory() async throws {
-        let items = try await fetchHistory()
+        let page = try await client.history()
+        store.setMode(page.mode)
+        let items = Self.map(page.messages)
         guard !items.isEmpty else { return }
         store.replaceAll(items)
     }
@@ -233,7 +242,11 @@ public final class ChatController: ObservableObject {
     /// Полный тред диалога с сервера (не инкремент — иначе замена ленты обрезала бы её
     /// до пары последних сообщений).
     private func fetchHistory() async throws -> [ChatMessage] {
-        try await client.history().map { item in
+        Self.map(try await client.history().messages)
+    }
+
+    private static func map(_ items: [HistoryMessage]) -> [ChatMessage] {
+        items.map { item in
             ChatMessage(
                 id: "srv-\(item.id)",
                 role: item.role,

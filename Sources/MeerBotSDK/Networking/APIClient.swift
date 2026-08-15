@@ -1,59 +1,60 @@
 // MeerBot iOS SDK — HTTP-клиент платформы.
 //
-// ── Какой контракт настоящий (сверено по коду agentbot-platform на 2026-08-11) ──────────
+// ── Контракт канала `mobile_app` (сверено по коду agentbot-platform на 2026-08-15) ──────
 //
-// ЧАТ живёт в `/api/v1/widget/*` и НИГДЕ больше:
-//   POST /api/v1/widget/session      — handshake pk_live_* + Origin → JWT (15 мин)
-//   POST /api/v1/widget/chat/stream  — SSE-поток ответа (тело: {message, conversationId?})
-//   GET  /api/v1/widget/messages     — догон истории после обрыва (?conversationId&since)
+// ОДИН ключ `pk_live_*` мобильного приложения и три эндпоинта СВОЕГО канала:
+//   POST /api/v1/mobile/register     — регистрация устройства → JWT (claim `ch=mobile_app`)
+//   POST /api/v1/mobile/chat/stream  — SSE-поток ответа (тело: {message})
+//   GET  /api/v1/mobile/messages     — догон истории (?since&limit)
 //
-// `/api/v1/mobile/*` — ТОЛЬКО регистрация устройства и аттестация; эндпоинта чата там нет:
-//   POST /api/v1/mobile/register     — upsert MobileDevice(APNs-токен) → JWT
-//   POST /api/v1/mobile/attestation  — App Attest (на бэкенде пока заглушка)
+// ── Что изменилось против 0.1.x и почему ────────────────────────────────────────────────
 //
-// Важное следствие (см. README, раздел «Два ключа»): JWT из `/mobile/register` НЕ подходит
-// для `/widget/chat/stream`. Он подписан с `aud = ClientMobileApp.id`, а chat/stream требует
-// `aud == ClientWebsiteWidget.id` того же ключа (`findActiveWidgetByApiKey`), и эти таблицы —
-// разные пространства id: `apiKeyId` уникален в каждой отдельно, у mobile-ключа строки
-// виджета нет вовсе → гарантированный `403 widget_not_active`. Поэтому чат ходит по ключу
-// headless-виджета, а пуши — по ключу мобильного приложения.
+//   • Ушли ДВА ключа. 0.1.x возил чат по ключу headless-виджета (`/api/v1/widget/*`), потому
+//     что чата в мобильном канале не существовало. Теперь он есть, и JWT из `/mobile/register`
+//     принимается им напрямую: канал заявлен claim'ом `ch`, а не подразумевается совпадением
+//     чисел в `aud`.
+//   • Ушёл `Origin`. Виджетный handshake пинует ключ по домену, и приложению приходилось
+//     вписывать `https://<bundleId>` в разрешённые домены кабинета. Мобильные роуты Origin не
+//     проверяют вовсе (`verifyWidgetJwt` зовётся без `expect.origin`) — заголовок больше не
+//     шлётся и в конфигурации его нет.
+//   • Ушёл `conversationId` из тела запроса. Диалог резолвит СЕРВЕР по паре (приложение,
+//     устройство) — тот же ключ, что строит `mobileExternalRef`. Клиент его больше не
+//     выбирает; наружу id приходит событием `meta` и нужен только чтобы подавить свой же пуш.
+//
+// ── `deviceToken` — это идентификатор устройства, а не адрес пуша ───────────────────────
+//
+// Поле обязательное и служит ключом уникальности `(приложение, deviceToken)`, то есть от него
+// зависит `MobileDevice.id`, а от него — ТРЕД диалога. Пуши платформа не отправляет вовсе
+// (решение владельца; единственный читатель поля — мёртвый `server/lib/mobile/push-service.ts`,
+// адресация наружу идёт по `external_user_id` в вебхуке интегратору). Поэтому SDK шлёт сюда
+// СТАБИЛЬНЫЙ идентификатор установки, а не APNs-токен:
+//   • APNs-токен появляется только после разрешения на уведомления — иначе чат был бы
+//     недоступен всем, кто его не дал, включая первый запуск до запроса разрешения;
+//   • APNs-токен меняется (переустановка, восстановление из бэкапа, ротация Apple) — смена
+//     значения завела бы НОВУЮ строку устройства, то есть новый тред с пустой историей.
+// Реальный APNs-токен остаётся у хост-приложения (`MeerBot.shared.pushToken`) и уходит на
+// бэкенд интегратора, который и шлёт пуш.
 
 import Foundation
 
 // MARK: - Конфигурация
 
 public struct MeerBotConfiguration {
-    /// pk_live_* headless-виджета (кабинет → Каналы → виджет). Транспорт чата.
+    /// `pk_live_*` мобильного приложения (кабинет → Бот → Каналы → Мобильные приложения).
+    /// Ключ публичен по замыслу — он зашит в бинарник; всё, что стоит между ним и платным
+    /// вызовом модели, — серверные лимиты и допуск.
     public let apiKey: String
-    /// pk_live_* мобильного приложения (кабинет → Мобильные приложения). Только для APNs.
-    public let pushApiKey: String?
     public let baseURL: URL
-    /// Значение заголовка `Origin`. Должно входить в «разрешённые домены» ключа, иначе
-    /// handshake вернёт 401 key_invalid. Дефолт — `https://<bundleId>`.
-    ///
-    /// Почему https, а не `mobile://`: кабинет принимает в разрешённые домены ТОЛЬКО
-    /// https-origin (`isValidOriginPattern` в api/client/widget/route.ts), так что схему
-    /// `mobile://` туда физически не вписать.
-    public let origin: String
     public let sdkVersion: String
 
     public init(
         apiKey: String,
-        pushApiKey: String? = nil,
         baseURL: URL = URL(string: MeerBotPlatform.apiBaseUrl)!,
-        origin: String? = nil,
         sdkVersion: String = MeerBotPlatform.version
     ) {
         self.apiKey = apiKey
-        self.pushApiKey = pushApiKey
         self.baseURL = baseURL
-        self.origin = origin ?? MeerBotConfiguration.defaultOrigin()
         self.sdkVersion = sdkVersion
-    }
-
-    static func defaultOrigin() -> String {
-        let bundleId = Bundle.main.bundleIdentifier ?? "unknown.app"
-        return "https://\(bundleId)"
     }
 }
 
@@ -63,7 +64,7 @@ public enum MeerBotError: Error, LocalizedError {
     /// `configure(...)` не вызван (или вызван с пустым ключом).
     case notConfigured
     /// Сервер ответил кодом ≥400. `code` — машинный код платформы (`key_invalid`,
-    /// `rate_limit_ip`, `quota_exceeded`, `jwt_expired`, …).
+    /// `rate_limited`, `identity_required`, `jwt_expired`, …).
     case http(status: Int, code: String, message: String)
     /// Транспортная ошибка: нет сети, обрыв соединения, таймаут.
     case network(code: URLError.Code, message: String)
@@ -85,20 +86,38 @@ public enum MeerBotError: Error, LocalizedError {
     }
 
     /// Текст для пользователя (русский) — то, что показывает ChatView.
+    ///
+    /// Коды перечислены по РЕАЛЬНЫМ отказам мобильных роутов (`_lib/context.ts`,
+    /// `mobile/admission.ts`, `chat/stream/route.ts`), а не по виджетным: они разошлись, и
+    /// незнакомый код давал бы бесполезное «Сервер недоступен» на понятной причине.
     public var userMessage: String {
         switch self {
         case .notConfigured:
             return "Чат не настроен. Вызовите MeerBot.shared.configure(apiKey:)."
         case let .http(status, code, _):
             switch code {
-            case "key_invalid":
-                return "Неверный ключ или домен приложения не разрешён в кабинете."
-            case "widget_not_active":
+            case "key_invalid", "key_revoked":
+                return "Неверный или отозванный ключ приложения."
+            case "mobile_app_inactive", "instance_disabled", "instance_not_found":
                 return "Канал отключён в кабинете."
-            case "quota_exceeded":
-                return "Дневной лимит расходов исчерпан."
-            case _ where code.hasPrefix("rate_limit"):
+            case "assistant_disabled":
+                return "Ассистент отключён в кабинете."
+            case "platform_mismatch":
+                return "Ключ выдан для другой платформы."
+            case "identity_required":
+                return "Приложение требует входа. Войдите и повторите."
+            case "daily_budget_exceeded", "insufficient_balance", "wallet_unavailable":
+                return "Чат временно недоступен: исчерпан лимит расходов."
+            case "conversation_cap_reached":
+                return "Достигнут месячный лимит новых обращений."
+            case "rate_limited":
                 return "Слишком много сообщений. Попробуйте через минуту."
+            case "message_too_long":
+                return "Сообщение слишком длинное."
+            case "channel_mismatch", "device_claim_missing", "device_not_found":
+                // Токен от другого канала/устройства либо устройство снято с регистрации.
+                // Обновление токена не помогает — нужна новая регистрация.
+                return "Сессия недействительна. Переподключаемся…"
             case _ where status == 401:
                 return "Сессия истекла. Переподключаемся…"
             default:
@@ -122,13 +141,30 @@ public enum MeerBotError: Error, LocalizedError {
 
 // MARK: - Модели ответов
 
-public struct WidgetSession: Equatable {
+/// Что сервер сделал с `identityToken`. Приходит В ОТВЕТЕ регистрации: провал проверки
+/// SOFT — сессия живёт, но пользователь анонимен, и без этого поля интегратор узнать об
+/// этом не может (единственным следом был бы серверный лог).
+public enum IdentityStatus: String, Equatable {
+    /// Токен не передавали — анонимная сессия.
+    case notProvided = "not_provided"
+    /// Идентичность подтверждена.
+    case verified
+    /// У приложения не настроен секрет подписи — токен проверить нечем.
+    case notConfigured = "not_configured"
+    /// Подпись верна, но токен выпущен давно (сервер принимает только свежие).
+    case stale
+    /// Подпись, срок или привязка к устройству не сошлись.
+    case rejected
+}
+
+public struct MobileSession: Equatable {
     public let jwt: String
     public let expiresIn: Int
-    public let conversationId: Int?
-    public let mode: ChatMode
-    public let title: String?
-    public let greeting: String?
+    /// Серверный id устройства. Тред диалога ключуется на нём.
+    public let deviceId: String
+    /// Приложение зарегистрировано, но аттестацию ещё не проходило.
+    public let attestationRequired: Bool
+    public let identityStatus: IdentityStatus
 }
 
 public struct HistoryMessage: Equatable {
@@ -138,9 +174,12 @@ public struct HistoryMessage: Equatable {
     public let createdAt: Date?
 }
 
-public struct DeviceRegistration: Equatable {
-    public let deviceId: String
-    public let attestationRequired: Bool
+/// Страница истории. `mode` отдаёт тот же роут: два эндпоинта одного канала не имеют права
+/// разойтись в том, кто сейчас отвечает пользователю.
+public struct HistoryPage: Equatable {
+    public let messages: [HistoryMessage]
+    public let hasMore: Bool
+    public let mode: ChatMode
 }
 
 // MARK: - Клиент
@@ -149,16 +188,25 @@ public struct DeviceRegistration: Equatable {
 public actor APIClient {
 
     private let config: MeerBotConfiguration
-    private let session: URLSession
+    /// Стабильный идентификатор установки — уходит в `deviceToken` (см. шапку файла).
+    private let installationId: String
     private let visitorUuid: String
+    private let session: URLSession
 
     private var jwt: String?
     private var jwtExpiresAt: Date?
-    /// Единственная выполняющаяся операция handshake — чтобы параллельные отправки
+    /// Единственная выполняющаяся операция регистрации — чтобы параллельные отправки
     /// не выписывали по своему JWT (сервер держит jti-allowlist, лишние токены — мусор).
     private var refreshTask: Task<String, Error>?
 
-    /// Диалог текущей сессии. Проставляется из `meta`/handshake, уходит в тело следующего запроса.
+    /// Подписанный бэкендом интегратора identity-токен. Уходит в СЛЕДУЮЩУЮ регистрацию:
+    /// связь устанавливается только там, чат читает уже подтверждённый claim.
+    private var identityToken: String?
+    /// Результат последней проверки identity — для диагностики на стороне хоста.
+    public private(set) var identityStatus: IdentityStatus = .notProvided
+
+    /// Диалог текущей сессии. Приходит событием `meta`; в запросы НЕ уходит — сервер резолвит
+    /// тред по паре (приложение, устройство).
     public private(set) var conversationId: Int?
     /// id последнего известного сообщения — точка догона после обрыва.
     public private(set) var lastMessageId: Int?
@@ -166,10 +214,12 @@ public actor APIClient {
     public init(
         config: MeerBotConfiguration,
         visitorUuid: String,
+        installationId: String,
         sessionConfiguration: URLSessionConfiguration = APIClient.defaultSessionConfiguration()
     ) {
         self.config = config
         self.visitorUuid = visitorUuid
+        self.installationId = installationId
         self.session = URLSession(configuration: sessionConfiguration)
     }
 
@@ -186,46 +236,63 @@ public actor APIClient {
 
     public func setConversationId(_ id: Int?) { conversationId = id }
 
-    // MARK: Handshake
+    /// Задать identity-токен. Применяется при следующей регистрации: чтобы связь установилась
+    /// немедленно, вызывающий сбрасывает текущий токен (`MeerBot.identify` так и делает).
+    public func setIdentityToken(_ token: String?) {
+        identityToken = token
+    }
 
-    /// Открыть сессию виджета. Идемпотентно: повторный вызов выдаёт новый JWT на тот же visitorUuid.
+    // MARK: Регистрация устройства (она же — открытие сессии)
+
+    /// Зарегистрировать устройство и получить JWT. Идемпотентно: повторный вызов обновляет
+    /// строку устройства (`upsert` по паре «приложение + идентификатор установки») и выдаёт
+    /// новый токен — тред при этом ТОТ ЖЕ.
     @discardableResult
-    public func openSession() async throws -> WidgetSession {
-        var request = makeRequest(path: "/api/v1/widget/session", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+    public func openSession() async throws -> MobileSession {
+        guard !config.apiKey.isEmpty else { throw MeerBotError.notConfigured }
+
+        var request = makeRequest(path: "/api/v1/mobile/register", method: "POST")
+        var body: [String: Any] = [
             "key": config.apiKey,
+            // Идентификатор установки, а не APNs-токен — см. шапку файла.
+            "deviceToken": installationId,
+            "platform": "ios",
             "visitorUuid": visitorUuid,
-            "hostOrigin": config.origin,
-        ])
+            "sdkVersion": config.sdkVersion,
+        ]
+        if let identityToken { body["identityToken"] = identityToken }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data = try await perform(request)
         guard
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
             let token = json["jwt"] as? String,
-            let expiresIn = json["expiresIn"] as? Int
+            let deviceId = json["deviceId"] as? String
         else {
             throw MeerBotError.invalidResponse
         }
 
+        // `expiresIn` обязателен по контракту, но его отсутствие не повод падать: без него
+        // токен считаем живым минуту — следующий запрос просто перевыпустит его.
+        let expiresIn = (json["expiresIn"] as? Int) ?? 60
         jwt = token
         jwtExpiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
 
-        let widget = json["widget"] as? [String: Any]
-        let restored = json["conversationId"] as? Int
-        if let restored { conversationId = restored }
+        let status = ((json["identity"] as? [String: Any])?["status"] as? String)
+            .flatMap(IdentityStatus.init(rawValue:)) ?? .notProvided
+        identityStatus = status
 
-        return WidgetSession(
+        return MobileSession(
             jwt: token,
             expiresIn: expiresIn,
-            conversationId: restored,
-            mode: ChatMode(rawValue: (json["mode"] as? String) ?? "") ?? .ai,
-            title: widget?["title"] as? String,
-            greeting: widget?["greeting"] as? String
+            deviceId: deviceId,
+            attestationRequired: (json["attestationRequired"] as? Bool) ?? false,
+            identityStatus: status
         )
     }
 
-    /// Действующий JWT: переиспользуем, пока до истечения больше минуты, иначе — новый handshake.
-    /// Параллельные вызовы разделяют одну операцию обновления.
+    /// Действующий JWT: переиспользуем, пока до истечения больше минуты, иначе — новая
+    /// регистрация. Параллельные вызовы разделяют одну операцию обновления.
     public func validToken() async throws -> String {
         if let jwt, let expiresAt = jwtExpiresAt, expiresAt.timeIntervalSinceNow > 60 {
             return jwt
@@ -246,52 +313,20 @@ public actor APIClient {
         jwtExpiresAt = nil
     }
 
-    // MARK: Регистрация устройства (APNs)
-
-    /// Зарегистрировать APNs-токен. Требует ключ мобильного приложения (`pushApiKey`).
-    @discardableResult
-    public func registerDevice(apnsToken: String) async throws -> DeviceRegistration {
-        guard let pushApiKey = config.pushApiKey, !pushApiKey.isEmpty else {
-            throw MeerBotError.notConfigured
-        }
-        var request = makeRequest(path: "/api/v1/mobile/register", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "key": pushApiKey,
-            "deviceToken": apnsToken,
-            "platform": "ios",
-            "visitorUuid": visitorUuid,
-            "sdkVersion": config.sdkVersion,
-        ])
-
-        let data = try await perform(request)
-        guard
-            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-            let deviceId = json["deviceId"] as? String
-        else {
-            throw MeerBotError.invalidResponse
-        }
-        // JWT из этого ответа СОЗНАТЕЛЬНО не сохраняем: он подписан на другое пространство id
-        // и для /widget/chat/stream невалиден (см. шапку файла).
-        return DeviceRegistration(
-            deviceId: deviceId,
-            attestationRequired: (json["attestationRequired"] as? Bool) ?? false
-        )
-    }
-
     // MARK: История (догон после обрыва)
 
     /// История диалога. Без `since` возвращает последние `limit` сообщений треда — именно
     /// это нужно для замены ленты после обрыва. `since` — инкрементальный догон.
-    public func history(since: Int? = nil, limit: Int = 50) async throws -> [HistoryMessage] {
-        guard let conversationId else { return [] }
+    ///
+    /// `conversationId` не передаётся: тред резолвится по устройству из токена. До первого
+    /// сообщения пользователя диалога ещё нет — сервер отвечает пустой лентой, а не ошибкой.
+    @discardableResult
+    public func history(since: Int? = nil, limit: Int = 50) async throws -> HistoryPage {
         var components = URLComponents(
-            url: config.baseURL.appendingPathComponent("/api/v1/widget/messages"),
+            url: config.baseURL.appendingPathComponent("/api/v1/mobile/messages"),
             resolvingAgainstBaseURL: false
         )
-        var query = [
-            URLQueryItem(name: "conversationId", value: String(conversationId)),
-            URLQueryItem(name: "limit", value: String(limit)),
-        ]
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
         if let since {
             query.append(URLQueryItem(name: "since", value: String(since)))
         }
@@ -327,7 +362,12 @@ public actor APIClient {
             )
         }
         if let last = messages.last?.id { lastMessageId = last }
-        return messages
+
+        return HistoryPage(
+            messages: messages,
+            hasMore: (json["hasMore"] as? Bool) ?? false,
+            mode: ChatMode(rawValue: (json["mode"] as? String) ?? "") ?? .ai
+        )
     }
 
     // MARK: Стрим ответа
@@ -358,12 +398,11 @@ public actor APIClient {
         allowRetry: Bool,
         continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation
     ) async throws {
-        var request = makeRequest(path: "/api/v1/widget/chat/stream", method: "POST")
+        var request = makeRequest(path: "/api/v1/mobile/chat/stream", method: "POST")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")
-        var body: [String: Any] = ["message": text]
-        if let conversationId { body["conversationId"] = conversationId }
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        // Тело — только текст: диалог выбирает сервер по устройству из токена.
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["message": text])
 
         let (bytes, response): (URLSession.AsyncBytes, URLResponse)
         do {
@@ -378,7 +417,9 @@ public actor APIClient {
             var payload = Data()
             for try await byte in bytes { payload.append(byte) }
             let error = Self.decodeError(status: http.statusCode, data: payload)
-            // Единственный автоматический повтор — на протухший токен.
+            // Единственный автоматический повтор — на протухший токен. `channel_mismatch`
+            // сюда НЕ попадает (403 и другой код): токен не протух, он от другого канала,
+            // и перевыпуск его не исправит.
             if http.statusCode == 401, error.code.hasPrefix("jwt_"), allowRetry {
                 invalidateToken()
                 try await runStream(text: text, allowRetry: false, continuation: continuation)
@@ -438,13 +479,13 @@ public actor APIClient {
     }
 
     private func applyCommonHeaders(_ request: inout URLRequest) {
-        // Origin в URLSession — обычный заголовок (не запрещённый, в отличие от браузера):
-        // сервер пинует по нему публичный ключ и сверяет с `oid` в JWT.
-        request.setValue(config.origin, forHTTPHeaderField: "Origin")
+        // Origin не шлём: мобильные роуты его не проверяют, а требование вписать
+        // `https://<bundleId>` в разрешённые домены ключа было платой за чужой (виджетный)
+        // контракт.
         request.setValue(config.sdkVersion, forHTTPHeaderField: "X-SDK-Version")
     }
 
-    /// Запрос без Authorization (handshake, регистрация устройства).
+    /// Запрос без Authorization (регистрация устройства).
     private func perform(_ request: URLRequest) async throws -> Data {
         let data: Data
         let response: URLResponse
@@ -480,6 +521,8 @@ public actor APIClient {
     }
 
     /// Ошибки платформы приходят в форме Stripe/OpenAI: `{error:{type,code,message}}`.
+    /// Форма общая у обоих мобильных роутов: `widgetError` (регистрация) и `mobileChatError`
+    /// (чат, история) собирают один и тот же конверт.
     static func decodeError(status: Int, data: Data) -> MeerBotError {
         guard
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],

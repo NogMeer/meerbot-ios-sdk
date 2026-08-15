@@ -4,15 +4,16 @@
 //
 //     MeerBot.shared.configure(apiKey: "pk_live_…")           // старт приложения
 //     MeerBot.shared.chatView()                               // SwiftUI-экран чата
+//     MeerBot.shared.identify(token: jwtОтВашегоБэкенда)      // после входа пользователя
 //     MeerBot.shared.setPushToken(deviceToken)                // AppDelegate, если нужны пуши
 //
-// Полный пример и требования к ключам — README.md.
+// Полный пример — README.md.
 
 import Foundation
 import SwiftUI
 
 public enum MeerBotPlatform {
-    public static let version = "0.1.0"
+    public static let version = "0.2.0"
     public static let apiBaseUrl = "https://meerbot.ru"
 }
 
@@ -26,35 +27,31 @@ public final class MeerBot {
     private var controller: ChatController?
     private var configuration: MeerBotConfiguration?
     private var visitorUuid: String?
-    /// APNs-токен, полученный до configure() — зарегистрируем, как только появится конфигурация.
-    private var pendingApnsToken: String?
+    /// identity-токен, переданный до configure() — применим, как только появится клиент.
+    private var pendingIdentityToken: String?
+
+    /// APNs-токен устройства, если хост его получил.
+    ///
+    /// Платформа пуши НЕ отправляет (решение владельца): «менеджер ответил» уходит вебхуком
+    /// на бэкенд интегратора, а адресует он по своему `external_user_id`. Токен здесь —
+    /// чтобы приложению было откуда его взять и отдать своему бэкенду; в MeerBot он не
+    /// уходит. См. `deviceToken` в шапке `APIClient`.
+    public private(set) var pushToken: String?
 
     private init() {}
 
     /// Настроить SDK.
     ///
     /// - Parameters:
-    ///   - apiKey: `pk_live_*` headless-виджета из кабинета — транспорт чата. Строка `origin`
-    ///     (по умолчанию `https://<bundleId>`) обязана быть в списке разрешённых доменов
-    ///     этого ключа, иначе handshake вернёт `key_invalid`.
-    ///   - pushApiKey: `pk_live_*` мобильного приложения — нужен ТОЛЬКО для APNs. Сегодня это
-    ///     отдельный ключ: JWT из `/mobile/register` не принимается чат-эндпоинтом (см. README,
-    ///     «Два ключа»). Без пушей параметр не нужен.
-    ///   - origin: переопределение заголовка `Origin`.
+    ///   - apiKey: `pk_live_*` мобильного приложения (кабинет → Бот → Каналы → Мобильные
+    ///     приложения). Один ключ на чат, историю и регистрацию; разрешённые домены и
+    ///     заголовок `Origin` каналу не нужны.
     ///   - baseURL: адрес платформы (для стенда).
     public func configure(
         apiKey: String,
-        pushApiKey: String? = nil,
-        origin: String? = nil,
         baseURL: URL = URL(string: MeerBotPlatform.apiBaseUrl)!
     ) {
-        let configuration = MeerBotConfiguration(
-            apiKey: apiKey,
-            pushApiKey: pushApiKey,
-            baseURL: baseURL,
-            origin: origin
-        )
-        configure(configuration)
+        configure(MeerBotConfiguration(apiKey: apiKey, baseURL: baseURL))
     }
 
     /// Настройка целиком объектом конфигурации (используется тестами и хост-приложениями,
@@ -67,6 +64,7 @@ public final class MeerBot {
         let client = APIClient(
             config: configuration,
             visitorUuid: visitorUuid,
+            installationId: Self.getOrCreateInstallationId(),
             sessionConfiguration: sessionConfiguration
         )
 
@@ -75,15 +73,46 @@ public final class MeerBot {
         self.client = client
         self.controller = ChatController(client: client)
 
-        // Handshake здесь СОЗНАТЕЛЬНО не делаем: `/widget/session` заводит строку
-        // WidgetVisitor, и рукопожатие на старте приложения записало бы «посетителя»
-        // каждому, кто чат ни разу не открыл, — это перекосило бы аналитику владельца.
-        // Сессия открывается при первом показе экрана; кому нужен прогрев — preconnect().
+        // Регистрация здесь СОЗНАТЕЛЬНО не делается: она заводит строку `MobileDevice`, и
+        // вызов на старте приложения записал бы «устройство» каждому, кто чат ни разу не
+        // открыл. Сессия открывается при первом показе экрана; кому нужен прогрев —
+        // preconnect().
 
-        if let token = pendingApnsToken {
-            pendingApnsToken = nil
-            setPushToken(hex: token)
+        if let token = pendingIdentityToken {
+            pendingIdentityToken = nil
+            identify(token: token)
         }
+    }
+
+    /// Связать чат с пользователем вашей системы.
+    ///
+    /// `token` — HS256-JWT, подписанный ВАШИМ бэкендом секретом этого приложения
+    /// (кабинет → Мобильные приложения → секрет подписи). Claims: `sub` — ваш id
+    /// пользователя, опционально `email`/`name`, обязательный `vid` = `visitorUuid`
+    /// устройства, и токен должен быть свежим (сервер принимает выпущенные не ранее пяти
+    /// минут назад).
+    ///
+    /// Токен применяется НЕМЕДЛЕННО: текущая сессия сбрасывается, и следующий запрос
+    /// перерегистрирует устройство уже с идентичностью. Результат проверки — в
+    /// `identityStatus`; провал SOFT: чат продолжает работать анонимно.
+    ///
+    /// `identify(token: nil)` — выход пользователя: связь на сервере НЕ стирается (она
+    /// принадлежит прежнему владельцу устройства), но новая сессия будет анонимной.
+    public func identify(token: String?) {
+        guard let client else {
+            pendingIdentityToken = token
+            return
+        }
+        Task {
+            await client.setIdentityToken(token)
+            await client.invalidateToken()
+        }
+    }
+
+    /// Что сервер сделал с последним `identityToken`. `nil` — регистрации ещё не было.
+    public func identityStatus() async -> IdentityStatus? {
+        guard let client else { return nil }
+        return await client.identityStatus
     }
 
     /// SwiftUI-экран чата. Возвращает готовый View — прикрепляйте к своей иерархии
@@ -117,10 +146,18 @@ public final class MeerBot {
     /// появится в аналитике владельца, даже если чат так и не откроют.
     public func preconnect() { controller?.start() }
 
-    /// Зарегистрировать APNs-токен (из `didRegisterForRemoteNotificationsWithDeviceToken`).
-    /// Требует `pushApiKey` в `configure`; без него вызов игнорируется с записью в лог.
+    /// Сохранить APNs-токен (из `didRegisterForRemoteNotificationsWithDeviceToken`).
+    ///
+    /// ⚠️ В MeerBot он НЕ отправляется. Пуш «менеджер ответил» шлёт ваш бэкенд — платформа
+    /// уведомляет его вебхуком и адресует по `external_user_id` из identity-токена. Метод
+    /// существует, чтобы токен лежал в одном известном месте (`MeerBot.shared.pushToken`)
+    /// и вы отдали его своему серверу.
+    ///
+    /// Почему не шлём: `deviceToken` на нашей стороне — ключ уникальности устройства, от
+    /// которого зависит тред диалога. Отправь мы туда APNs-токен, его ротация или
+    /// восстановление из бэкапа заводили бы пользователю новый диалог с пустой историей.
     public func setPushToken(_ deviceToken: Data) {
-        setPushToken(hex: deviceToken.map { String(format: "%02x", $0) }.joined())
+        pushToken = deviceToken.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Обработать входящий пуш. Возвращает `true`, если пуш наш и обработан.
@@ -134,8 +171,13 @@ public final class MeerBot {
         return true
     }
 
-    /// Сбросить состояние SDK (GDPR Art. 17 на стороне клиента): визитор, история, токены.
-    /// Серверные данные удаляет `POST /api/v1/widget/visitor/forget` — отдельный вызов.
+    /// Сбросить состояние SDK (GDPR Art. 17 на стороне клиента): идентификатор установки,
+    /// визитор, история, токены.
+    ///
+    /// ⚠️ Новый идентификатор установки означает НОВЫЙ тред: прежняя переписка остаётся на
+    /// сервере за прежним устройством и в приложении больше не появится. Серверного
+    /// эндпоинта стирания у мобильного канала пока нет — удаление данных заказывается
+    /// владельцу проекта.
     public func reset() {
         controller?.stop()
         controller?.store.resetForLogout()
@@ -143,40 +185,35 @@ public final class MeerBot {
         controller = nil
         configuration = nil
         visitorUuid = nil
-        pendingApnsToken = nil
+        pendingIdentityToken = nil
+        pushToken = nil
         UserDefaults.standard.removeObject(forKey: Self.visitorUuidKey)
+        UserDefaults.standard.removeObject(forKey: Self.installationIdKey)
     }
 
     // MARK: - Внутреннее
 
-    private func setPushToken(hex: String) {
-        guard let client, let configuration else {
-            // configure() ещё не вызван — запомним и зарегистрируем после.
-            pendingApnsToken = hex
-            return
-        }
-        guard configuration.pushApiKey?.isEmpty == false else {
-            print("[MeerBot] setPushToken проигнорирован: не задан pushApiKey в configure(...)")
-            return
-        }
-        Task {
-            do {
-                _ = try await client.registerDevice(apnsToken: hex)
-            } catch {
-                // Пуши — не критичный путь: чат работает и без них. Молча не глотаем.
-                print("[MeerBot] регистрация APNs-токена не удалась: \(error.localizedDescription)")
-            }
-        }
-    }
-
     private static let visitorUuidKey = "meerbot.visitorUuid"
+    private static let installationIdKey = "meerbot.installationId"
 
     private static func getOrCreateVisitorUuid() -> String {
-        if let stored = UserDefaults.standard.string(forKey: visitorUuidKey), stored.count == 36 {
+        getOrCreateUuid(forKey: visitorUuidKey)
+    }
+
+    /// Идентификатор установки — то, что уходит в `deviceToken` регистрации и через
+    /// `MobileDevice.id` определяет тред. Отдельный ключ от `visitorUuid`: у них разные
+    /// роли на сервере (один — колонка визитора, второй — ключ уникальности устройства), и
+    /// склеенные они однажды разъедутся молча.
+    private static func getOrCreateInstallationId() -> String {
+        getOrCreateUuid(forKey: installationIdKey)
+    }
+
+    private static func getOrCreateUuid(forKey key: String) -> String {
+        if let stored = UserDefaults.standard.string(forKey: key), stored.count == 36 {
             return stored
         }
         let new = UUID().uuidString.lowercased()
-        UserDefaults.standard.set(new, forKey: visitorUuidKey)
+        UserDefaults.standard.set(new, forKey: key)
         return new
     }
 }

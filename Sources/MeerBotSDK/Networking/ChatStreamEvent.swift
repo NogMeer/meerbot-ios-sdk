@@ -1,18 +1,23 @@
 // MeerBot iOS SDK — типизированные события чат-стрима.
 //
-// Соответствие событий бэкенду — `src/app/api/v1/widget/chat/stream/route.ts`:
+// Соответствие событий бэкенду — `src/app/api/v1/mobile/chat/stream/route.ts`. Форма кадров
+// намеренно совпадает с виджетной (`/api/v1/widget/chat/stream`), поэтому парсер один:
 //   event: meta                 → {conversationId, mode}
 //   (без event)                 → OpenAI-совместимый чанк {choices:[{delta:{content}}]}
-//   data: [DONE]                → генерация AI завершена (стрим может остаться открытым
-//                                 ради ответов менеджера в режиме pending_escalation)
+//   data: [DONE]                → генерация AI завершена
 //   event: manager_message      → {messageId, role, text, authorName, createdAt}
-//   event: escalation           → {triggered, reason, forumTopicId?}
-//   event: forwarded_to_manager → {mode}
+//   event: forwarded_to_manager → {mode} — диалог ведёт менеджер, модель не звалась
 //   event: heartbeat            → {} каждые 15 с
-//   event: usage                → квота (только хелп-виджет кабинета)
 //   event: error                → {code, message}
 //   event: timeout              → достигнут max lifetime (30 мин)
 //   event: shutdown             → плановый рестарт сервера, НЕ сетевой сбой
+//
+// Разбираются, но мобильным каналом СЕГОДНЯ не шлются — оставлены, потому что стоят дешевле
+// молчаливого пропуска, если появятся:
+//   event: escalation           → у канала эскалация в инбокс выключена (`escalateToInbox`
+//                                 в capabilities = false), флаг «нужен человек» ставится
+//                                 молча, и пользователю менеджера не обещают;
+//   event: usage                → квота кабинетного хелп-виджета, мобильному не адресована.
 
 import Foundation
 
