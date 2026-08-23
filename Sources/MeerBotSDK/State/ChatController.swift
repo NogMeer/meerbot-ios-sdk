@@ -102,6 +102,26 @@ public final class ChatController: ObservableObject {
         }
     }
 
+    /// Привести ленту к серверной, не открывая новый диалог и не перерегистрируя устройство.
+    ///
+    /// Когда звать: приложение вернулось на передний план либо его бэкенд получил вебхук
+    /// `manager_reply` и разбудил приложение пушем. Своей отправки пушей у платформы нет —
+    /// ответ менеджера уходит вебхуком на бэкенд интегратора, и он же адресует пуш.
+    ///
+    /// Отличие от `openConversation(id:)`: тот ПЕРЕКЛЮЧАЕТ тред по id из пуша, этот просто
+    /// перечитывает текущий. Паритет с Android (`MeerBot.refresh()`).
+    public func refresh() {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.loadHistory()
+                self.store.setError(nil)
+            } catch {
+                self.store.setError(Self.message(for: error))
+            }
+        }
+    }
+
     public func stop() {
         streamTask?.cancel()
         streamTask = nil

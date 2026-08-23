@@ -260,6 +260,33 @@ final class ChatControllerTests: XCTestCase {
         XCTAssertEqual(controller.store.messages.last?.authorName, "Роман")
     }
 
+    /// `refresh()` перечитывает ТЕКУЩИЙ тред — в отличие от `openConversation(id:)`,
+    /// которому нужен id из пуша. Пуш канала приходить без id имеет право: тред у мобильного
+    /// пользователя один, и бэкенд интегратора адресует его своим `external_user_id`.
+    func testRefreshПодтягиваетЛентуБезIdДиалога() async throws {
+        stubRegister()
+        stubHistory()
+
+        // Оба ответа кладутся ЗАРАНЕЕ: очередь стаба отдаёт их по порядку, а последний
+        // повторяет. Досыпать второй ответ после старта нельзя — стартовый (пустой) остался
+        // бы первым в очереди и достался бы как раз `refresh()`.
+        stubHistory([
+            ["id": 12, "role": "assistant", "content": "Менеджер ответил", "authorKind": "manager"],
+        ], mode: "human")
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("готовности сессии") { controller.isReady }
+        XCTAssertTrue(controller.store.messages.isEmpty, "на старте лента ещё пуста")
+
+        controller.refresh()
+
+        try await waitUntil("обновления ленты") {
+            controller.store.messages.last?.author == "manager"
+        }
+        XCTAssertNil(controller.conversationId, "refresh не выдумывает id диалога")
+    }
+
     // MARK: - conversationId наружу
 
     // Приложение хоста получает пуш «менеджер ответил» СВОИМ бэкендом (платформа шлёт вебхук,
