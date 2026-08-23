@@ -236,6 +236,30 @@ final class ChatControllerTests: XCTestCase {
         }
     }
 
+    /// Тот же пуш, но проверяем ПОДПИСЬ: ответ менеджера, прочитанный из истории, обязан
+    /// остаться ответом менеджера. Экран рисует автора по этому полю, и до 2026-08-23
+    /// пользователь после возврата в приложение видел живого оператора как бота.
+    func testОтветМенеджераИзИсторииНеВыглядитОтветомБота() async throws {
+        stubRegister()
+        stubHistory([
+            ["id": 7, "role": "assistant", "content": "Я бот", "authorKind": "ai"],
+            [
+                "id": 8,
+                "role": "assistant",
+                "content": "Разберусь с подпиской",
+                "authorKind": "manager",
+                "authorName": "Роман",
+            ],
+        ], mode: "human")
+
+        let controller = makeController()
+        controller.openConversation(id: 55)
+
+        try await waitUntil("загрузки ленты") { controller.store.messages.count == 2 }
+        XCTAssertEqual(controller.store.messages.map(\.author), ["ai", "manager"])
+        XCTAssertEqual(controller.store.messages.last?.authorName, "Роман")
+    }
+
     // MARK: - conversationId наружу
 
     // Приложение хоста получает пуш «менеджер ответил» СВОИМ бэкендом (платформа шлёт вебхук,

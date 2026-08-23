@@ -172,6 +172,28 @@ public struct HistoryMessage: Equatable {
     public let role: String
     public let content: String
     public let createdAt: Date?
+    /// `ai` | `manager` у ответов ассистентской роли, `nil` у остальных. Сервер отдаёт поле
+    /// с 2026-08-23; у старых сборок платформы его нет — тогда автор считается ботом, как и
+    /// считался раньше.
+    public let authorKind: String?
+    /// Подпись менеджера для UI. Может быть `nil` даже при `authorKind == "manager"`.
+    public let authorName: String?
+
+    public init(
+        id: Int,
+        role: String,
+        content: String,
+        createdAt: Date?,
+        authorKind: String? = nil,
+        authorName: String? = nil
+    ) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.createdAt = createdAt
+        self.authorKind = authorKind
+        self.authorName = authorName
+    }
 }
 
 /// Страница истории. `mode` отдаёт тот же роут: два эндпоинта одного канала не имеют права
@@ -358,7 +380,9 @@ public actor APIClient {
                 id: id,
                 role: role,
                 content: content,
-                createdAt: (item["createdAt"] as? String).flatMap { formatter.date(from: $0) }
+                createdAt: (item["createdAt"] as? String).flatMap { formatter.date(from: $0) },
+                authorKind: item["authorKind"] as? String,
+                authorName: item["authorName"] as? String
             )
         }
         if let last = messages.last?.id { lastMessageId = last }

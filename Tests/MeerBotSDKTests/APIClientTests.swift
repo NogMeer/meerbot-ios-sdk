@@ -409,6 +409,56 @@ final class APIClientTests: XCTestCase {
         XCTAssertNotNil(request.headers["Authorization"])
     }
 
+    /// Ответ менеджера в истории обязан оставаться ответом менеджера.
+    ///
+    /// В потоке автор приходит кадром `operator_message`, но после перезапуска приложения
+    /// лента перечитывается из `/messages` — и до 2026-08-23 подпись человека там терялась:
+    /// клиент видел ответ живого оператора как ответ бота ровно в том сценарии, ради
+    /// которого канал и делался («менеджер ответил → пуш → пользователь вернулся»).
+    func testАвторСообщенияВИсторииРазличаетМенеджераИБота() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "messages": [
+                    ["id": 20, "role": "assistant", "content": "Я бот", "authorKind": "ai"],
+                    [
+                        "id": 21,
+                        "role": "assistant",
+                        "content": "Я живой",
+                        "authorKind": "manager",
+                        "authorName": "Роман",
+                    ],
+                ],
+                "hasMore": false,
+                "mode": "human",
+            ])
+        )
+
+        let page = try await makeClient().history()
+
+        XCTAssertEqual(page.messages.map(\.authorKind), ["ai", "manager"])
+        XCTAssertEqual(page.messages.last?.authorName, "Роман")
+    }
+
+    /// Старая сборка платформы поля не отдаёт — автор считается ботом, как и раньше.
+    /// Фолбэк важен: SDK обновляется у клиента раньше, чем катится наш деплой.
+    func testИсторияБезПоляАвтораНеЛомается() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "messages": [["id": 30, "role": "assistant", "content": "Ответ"]],
+                "hasMore": false,
+                "mode": "ai",
+            ])
+        )
+
+        let page = try await makeClient().history()
+
+        XCTAssertNil(page.messages.first?.authorKind)
+    }
+
     /// Диалога ещё нет (пользователь не писал) — сервер отвечает пустой лентой и 200.
     /// Для клиента это штатный старт, а не ошибка.
     func testПустаяИсторияДоПервогоСообщенияНеОшибка() async throws {

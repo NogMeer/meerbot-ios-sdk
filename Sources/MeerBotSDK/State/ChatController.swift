@@ -245,12 +245,23 @@ public final class ChatController: ObservableObject {
         Self.map(try await client.history().messages)
     }
 
+    /// Автор берётся из ответа сервера, а не выводится из роли.
+    ///
+    /// Раньше здесь стояло `role == "assistant" ? "ai"`, и ответ живого менеджера,
+    /// прочитанный из истории, подписывался ботом: в потоке автор приходит кадром
+    /// `operator_message`, но после перезапуска приложения лента перечитывается отсюда.
+    /// То есть подпись менеджера жила ровно до сворачивания приложения — в сценарии
+    /// «менеджер ответил → пуш → пользователь вернулся» её не было никогда.
+    ///
+    /// `authorKind` отсутствует у старых сборок платформы → фолбэк на прежнее поведение.
     private static func map(_ items: [HistoryMessage]) -> [ChatMessage] {
         items.map { item in
-            ChatMessage(
+            let isManager = item.authorKind == "manager"
+            return ChatMessage(
                 id: "srv-\(item.id)",
                 role: item.role,
-                author: item.role == "assistant" ? "ai" : nil,
+                author: item.role == "assistant" ? (isManager ? "manager" : "ai") : nil,
+                authorName: isManager ? item.authorName : nil,
                 content: item.content,
                 timestamp: item.createdAt ?? Date()
             )
