@@ -122,32 +122,51 @@ struct MessagesList: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    if store.messages.isEmpty {
-                        VStack(spacing: 12) {
-                            Image(systemName: "bubble.left.and.bubble.right")
-                                .font(.system(size: 40))
-                                .foregroundColor(.secondary)
-                            Text(store.greeting ?? "Привет! Чем могу помочь?")
-                                .multilineTextAlignment(.center)
-                                .foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 24)
-                        .padding(.top, 40)
-                    } else {
-                        ForEach(store.messages) { msg in
-                            MessageBubbleView(message: msg)
-                                .id(msg.id)
-                        }
+            scrollView(proxy: proxy)
+        }
+    }
+
+    /// Протягивание переписки убирает клавиатуру — так ведёт себя любой мессенджер,
+    /// и без этого выйти из ввода нечем: своей кнопки «Готово» у поля нет, а хост-
+    /// приложение обычно показывает экран без навигационной панели.
+    ///
+    /// `scrollDismissesKeyboard` появился в iOS 16; на iOS 15 остаётся прежнее
+    /// поведение — клавиатуру там закрывает хост-приложение своими средствами.
+    @ViewBuilder
+    private func scrollView(proxy: ScrollViewProxy) -> some View {
+        if #available(iOS 16.0, macOS 13.0, *) {
+            list(proxy: proxy).scrollDismissesKeyboard(.interactively)
+        } else {
+            list(proxy: proxy)
+        }
+    }
+
+    private func list(proxy: ScrollViewProxy) -> some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                if store.messages.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "bubble.left.and.bubble.right")
+                            .font(.system(size: 40))
+                            .foregroundColor(.secondary)
+                        Text(store.greeting ?? "Привет! Чем могу помочь?")
+                            .multilineTextAlignment(.center)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 24)
+                    .padding(.top, 40)
+                } else {
+                    ForEach(store.messages) { msg in
+                        MessageBubbleView(message: msg)
+                            .id(msg.id)
                     }
                 }
             }
-            .onChange(of: store.messages.count) { _ in
-                if let last = store.messages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
+        }
+        .onChange(of: store.messages.count) { _ in
+            if let last = store.messages.last {
+                withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
             }
         }
     }
