@@ -15,6 +15,10 @@ public struct ChatView: View {
     private let primaryColor: Color
     private let onClose: (() -> Void)?
 
+    /// Фокус поля ввода. Живёт ЗДЕСЬ, а не в `ChatInput`: снимать его должен список
+    /// сообщений по тапу, а из дочернего вью до чужого `@FocusState` не дотянуться.
+    @FocusState private var inputFocused: Bool
+
     /// - Parameter controller: связка с API. `MeerBot.shared.chatView()` передаёт свой;
     ///   отдельный контроллер нужен, только если приложение ведёт несколько независимых чатов.
     public init(
@@ -36,12 +40,25 @@ public struct ChatView: View {
                 title: title,
                 primaryColor: primaryColor,
                 onClose: {
+                    // Отклик — ДО закрытия: экран уезжает мгновенно, и вызванный после
+                    // генератор успел бы уйти из памяти вместе с вью.
+                    MBHaptics.lightImpact()
                     onClose?()
                     dismiss()
                 }
             )
             Divider()
             MessagesList(store: store)
+                // ТАП по переписке убирает клавиатуру. Протягивания
+                // (`scrollDismissesKeyboard`) недостаточно: оно требует, чтобы списку было
+                // куда прокручиваться, а в свежем диалоге сообщений одно-два — тянуть
+                // нечего, и выйти из ввода было нечем вовсе.
+                //
+                // `contentShape` обязателен: у `ScrollView` пустое место не входит в
+                // площадь попадания, и тап мимо пузыря — а это как раз «пустое место», по
+                // которому целится человек, — не доходил бы до жеста.
+                .contentShape(Rectangle())
+                .onTapGesture { inputFocused = false }
             if let typing = store.operatorTyping {
                 HStack(spacing: 8) {
                     TypingIndicator()
@@ -62,6 +79,7 @@ public struct ChatView: View {
             ChatInput(
                 store: store,
                 primaryColor: primaryColor,
+                isFocused: $inputFocused,
                 onSend: { controller.send($0) }
             )
         }
@@ -196,6 +214,8 @@ struct TypingIndicator: View {
 struct ChatInput: View {
     @ObservedObject var store: ChatStore
     let primaryColor: Color
+    /// Фокус ввода принадлежит экрану целиком (см. `ChatView.inputFocused`).
+    @FocusState.Binding var isFocused: Bool
     let onSend: (String) -> Void
 
     @State private var localDraft: String = ""
@@ -219,6 +239,7 @@ struct ChatInput: View {
             // Многострочный ввод (`axis:`) появился только в iOS 16 — на iOS 15
             // остаётся однострочное поле, всё остальное поведение то же.
             textField
+                .focused($isFocused)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(Color.mbSurfaceSecondary)
