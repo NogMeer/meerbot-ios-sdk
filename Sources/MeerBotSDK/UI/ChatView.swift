@@ -138,6 +138,14 @@ private struct ConnectionBanner: View {
 struct MessagesList: View {
     @ObservedObject var store: ChatStore
 
+    /// Первая порция истории уже показана? До неё прыжок вниз делается БЕЗ анимации.
+    ///
+    /// История грузится асинхронно уже после открытия экрана, поэтому анимированный
+    /// скролл на ней читается как «чат открылся сверху и поехал вниз» — мессенджеры
+    /// так себя не ведут, переписка обязана открываться сразу на последнем сообщении.
+    /// Анимация остаётся там, где она уместна: новое сообщение в открытом чате.
+    @State private var didInitialScroll = false
+
     var body: some View {
         ScrollViewReader { proxy in
             scrollView(proxy: proxy)
@@ -183,8 +191,21 @@ struct MessagesList: View {
             }
         }
         .onChange(of: store.messages.count) { _ in
-            if let last = store.messages.last {
+            guard let last = store.messages.last else { return }
+
+            if didInitialScroll {
                 withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                return
+            }
+
+            didInitialScroll = true
+            // Без анимации — экран должен ОТКРЫТЬСЯ внизу, а не доехать туда.
+            proxy.scrollTo(last.id, anchor: .bottom)
+            // Второй проход после кадра отрисовки: список ленивый (`LazyVStack`), и в
+            // момент прихода истории нижние ячейки ещё не материализованы — `scrollTo`
+            // по их id тогда не срабатывает вовсе, и чат так и остаётся сверху.
+            DispatchQueue.main.async {
+                proxy.scrollTo(last.id, anchor: .bottom)
             }
         }
     }
