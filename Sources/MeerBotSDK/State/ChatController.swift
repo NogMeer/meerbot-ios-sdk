@@ -5,6 +5,9 @@
 
 import Foundation
 import Combine
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 public final class ChatController: ObservableObject {
@@ -33,16 +36,74 @@ public final class ChatController: ObservableObject {
 
     private var streamTask: Task<Void, Never>?
     private var startTask: Task<Void, Never>?
+    private var pollTask: Task<Void, Never>?
+    /// Экран чата на виду. Догон крутится ТОЛЬКО когда `screenVisible && isReady`.
+    private var screenVisible = false
+    private var lifecycleSubscriptions = Set<AnyCancellable>()
+
+    /// Периоды догона — те же, что у веб-виджета. `var` ради тестов: они ужимают их до
+    /// миллисекунд, иначе проверка «ответ менеджера доехал» ждала бы шесть секунд.
+    static var managerPollInterval: TimeInterval = 6
+    static var idlePollInterval: TimeInterval = 12
+    /// Потолок страниц за один догон: сервер отдаёт `hasMore`, но цикл не имеет права стать
+    /// бесконечным — при расхождении курсора он выжег бы батарею молча.
+    private static let maxCatchUpPages = 5
 
     public init(client: APIClient) {
         self.client = client
+        observeAppLifecycle()
+    }
+
+    /// Возврат приложения из фона.
+    ///
+    /// Подписка живёт в КОНТРОЛЛЕРЕ, а не во вью, по двум причинам. Первая: `chatController()`
+    /// — задокументированная точка интеграции для хостов, которые рисуют свой UI, и поведение
+    /// SDK не имеет права зависеть от того, наш ли экран на виду. Вторая: `swift test` идёт на
+    /// macOS, где UIKit нет, а `scenePhase` из XCTest не подделать — метод ниже тест зовёт
+    /// напрямую.
+    private func observeAppLifecycle() {
+        #if canImport(UIKit)
+        NotificationCenter.default
+            .publisher(for: UIApplication.willEnterForegroundNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.onEnterForeground() }
+            }
+            .store(in: &lifecycleSubscriptions)
+        NotificationCenter.default
+            .publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.onEnterBackground() }
+            }
+            .store(in: &lifecycleSubscriptions)
+        #endif
+    }
+
+    /// Приложение вернулось на передний план: догоняем немедленно, не дожидаясь тика.
+    func onEnterForeground() {
+        guard screenVisible, isReady else { return }
+        Task { [weak self] in await self?.catchUp(silent: true) }
+        startPolling()
+    }
+
+    /// Ушли в фон: опрос останавливаем — в фоне он всё равно не даёт ничего, кроме трафика.
+    func onEnterBackground() {
+        stopPolling()
     }
 
     /// Зарегистрировать устройство и подтянуть историю треда.
     public func start() {
-        // Повторный onAppear не должен выписывать новый JWT: каждая регистрация — это ещё
-        // один jti в Redis-allowlist и upsert устройства на сервере.
-        guard startTask == nil, !isReady else { return }
+        screenVisible = true
+        guard startTask == nil else { return }
+
+        // Сессия уже поднята: контроллер живёт в синглтоне SDK и переживает закрытие экрана.
+        // Второй handshake не нужен (каждая регистрация — ещё один jti в Redis-allowlist и
+        // upsert устройства), НО пока экран был закрыт, менеджер мог ответить. Раньше здесь
+        // стоял молчаливый выход, и повторное открытие чата не перечитывало ленту вовсе.
+        if isReady {
+            Task { [weak self] in await self?.catchUp(silent: true) }
+            startPolling()
+            return
+        }
         startTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -54,6 +115,7 @@ public final class ChatController: ObservableObject {
                 // пользователю (`ai` | `human`), знает только серверная строка диалога.
                 try? await self.loadHistory()
                 self.isReady = true
+                self.startPolling()
             } catch {
                 self.isReady = false
                 self.store.setError(Self.message(for: error))
@@ -111,23 +173,77 @@ public final class ChatController: ObservableObject {
     /// Отличие от `openConversation(id:)`: тот ПЕРЕКЛЮЧАЕТ тред по id из пуша, этот просто
     /// перечитывает текущий. Паритет с Android (`MeerBot.refresh()`).
     public func refresh() {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await self.loadHistory()
-                self.store.setError(nil)
-            } catch {
-                self.store.setError(Self.message(for: error))
-            }
-        }
+        Task { [weak self] in await self?.catchUp(silent: false) }
     }
 
     public func stop() {
+        screenVisible = false
+        stopPolling()
         streamTask?.cancel()
         streamTask = nil
         startTask?.cancel()
         startTask = nil
         store.setSending(false)
+        // `isReady` СОЗНАТЕЛЬНО не сбрасываем: сессия остаётся живой, и следующее открытие
+        // экрана обойдётся догоном вместо новой регистрации устройства.
+    }
+
+    // MARK: - Догон ленты
+
+    /// Пока экран открыт, лента подтягивается сама.
+    ///
+    /// Это ЕДИНСТВЕННЫЙ надёжный канал «менеджер ответил → пользователь увидел»: поток
+    /// живёт только на время ответа бота, а пуш зависит от бэкенда интегратора. Период
+    /// пересчитывается на каждом витке, поэтому переход диалога к человеку ускоряет догон
+    /// со следующего тика, без пересоздания задачи.
+    private func startPolling() {
+        guard pollTask == nil else { return }
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let interval = await MainActor.run {
+                    self.store.mode == .human || self.store.mode == .pendingEscalation
+                        ? Self.managerPollInterval
+                        : Self.idlePollInterval
+                }
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                if Task.isCancelled { return }
+                await self.catchUp(silent: true)
+            }
+        }
+    }
+
+    private func stopPolling() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
+    /// Подтянуть всё, что появилось после нашего курсора.
+    ///
+    /// `silent` — фоновый тик: его ошибки НЕ красят экран. Оборванная сеть у человека,
+    /// который просто смотрит на переписку, не повод показывать ему «нет связи»; настоящую
+    /// ошибку он и так увидит при отправке.
+    ///
+    /// Во время отправки догон не идёт: серверная страница принесла бы половину ещё
+    /// стримящегося ответа и подралась бы с плейсхолдером.
+    private func catchUp(silent: Bool) async {
+        guard isReady, !store.sending else { return }
+
+        do {
+            for _ in 0..<Self.maxCatchUpPages {
+                let cursor = store.lastServerMessageId
+                let page = try await client.history(since: cursor > 0 ? cursor : nil, limit: 50)
+                store.setMode(page.mode)
+                store.mergeServerMessages(Self.map(page.messages))
+                if !page.hasMore { break }
+            }
+            // Баннер снимаем только если повторять нечего: иначе с экрана исчезла бы кнопка
+            // «Повторить» вместе с сообщением о том, почему она там.
+            if retryableText == nil { store.setError(nil) }
+        } catch {
+            guard !silent else { return }
+            store.setError(Self.message(for: error))
+        }
     }
 
     // MARK: - Поток
@@ -148,6 +264,10 @@ public final class ChatController: ObservableObject {
                 self.store.finalizeAssistant(id: placeholder.id)
                 self.store.dropEmptyPlaceholder(id: placeholder.id)
                 self.store.setSending(false)
+                // Разовый догон сразу после потока: он проставляет серверные id только что
+                // отправленному сообщению и ответу. Без него первый же тик поллинга принёс бы
+                // обе строки как «новые», и слияние держалось бы на совпадении текста.
+                await self.catchUp(silent: true)
             } catch {
                 await self.handleFailure(
                     error,
@@ -279,6 +399,7 @@ public final class ChatController: ObservableObject {
             let isManager = item.authorKind == "manager"
             return ChatMessage(
                 id: "srv-\(item.id)",
+                serverId: item.id,
                 role: item.role,
                 author: item.role == "assistant" ? (isManager ? "manager" : "ai") : nil,
                 authorName: isManager ? item.authorName : nil,
