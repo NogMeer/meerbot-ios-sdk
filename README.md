@@ -3,7 +3,7 @@
 Экран чата с ИИ-ассистентом MeerBot внутри вашего iOS-приложения: SwiftUI-вью, потоковые
 ответы (SSE), эскалация на менеджера, догон истории после обрыва связи, пуш-уведомления.
 
-**Статус:** `0.2.2` — рабочий чат на собственном канале платформы (`mobile_app`), один ключ,
+**Статус:** `0.2.4` — рабочий чат на собственном канале платформы (`mobile_app`), один ключ,
 verified identity. Не сделано: вложения, App Attest, cert pinning.
 См. [Границы](#границы-текущей-версии).
 
@@ -34,7 +34,7 @@ https://github.com/NogMeer/meerbot-ios-sdk
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/NogMeer/meerbot-ios-sdk.git", from: "0.2.0")
+    .package(url: "https://github.com/NogMeer/meerbot-ios-sdk.git", .upToNextMinor(from: "0.2.4"))
 ]
 ```
 
