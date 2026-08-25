@@ -190,23 +190,33 @@ struct MessagesList: View {
                 }
             }
         }
+        // Открытие экрана. Одного `onChange` мало: `ChatStore` живёт в синглтоне
+        // `MeerBot.shared` и переживает закрытие чата, поэтому при ПОВТОРНОМ открытии
+        // список уже непустой, `messages.count` не меняется — и `onChange` не срабатывает
+        // вовсе. Без этой ветки второй заход в чат всегда открывался сверху.
+        .onAppear { jumpToBottom(proxy, animated: false) }
         .onChange(of: store.messages.count) { _ in
-            guard let last = store.messages.last else { return }
+            // Первый приход истории — мгновенно (экран должен ОТКРЫТЬСЯ внизу, а не
+            // доехать туда); дальше новые сообщения — с анимацией, как в мессенджерах.
+            jumpToBottom(proxy, animated: didInitialScroll)
+        }
+    }
 
-            if didInitialScroll {
-                withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                return
-            }
+    private func jumpToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        guard let last = store.messages.last else { return }
+        didInitialScroll = true
 
-            didInitialScroll = true
-            // Без анимации — экран должен ОТКРЫТЬСЯ внизу, а не доехать туда.
+        if animated {
+            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+            return
+        }
+
+        proxy.scrollTo(last.id, anchor: .bottom)
+        // Второй проход после кадра отрисовки: список ленивый (`LazyVStack`), и в момент
+        // открытия нижние ячейки ещё не материализованы — `scrollTo` по их id тогда не
+        // срабатывает вовсе, и чат так и остаётся сверху.
+        DispatchQueue.main.async {
             proxy.scrollTo(last.id, anchor: .bottom)
-            // Второй проход после кадра отрисовки: список ленивый (`LazyVStack`), и в
-            // момент прихода истории нижние ячейки ещё не материализованы — `scrollTo`
-            // по их id тогда не срабатывает вовсе, и чат так и остаётся сверху.
-            DispatchQueue.main.async {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
         }
     }
 }
