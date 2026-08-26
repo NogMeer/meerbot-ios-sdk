@@ -13,7 +13,7 @@ import Foundation
 import SwiftUI
 
 public enum MeerBotPlatform {
-    public static let version = "0.2.4"
+    public static let version = "0.2.6"
     public static let apiBaseUrl = "https://meerbot.ru"
 }
 

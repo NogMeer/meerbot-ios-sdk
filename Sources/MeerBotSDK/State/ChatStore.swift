@@ -101,14 +101,28 @@ public final class ChatStore: ObservableObject {
         return msg
     }
 
+    /// Дописать кусок потока. Пробелы В НАЧАЛЕ ответа отбрасываются, пока текст пуст.
+    ///
+    /// Модель начинает ответ с перевода строки чаще, чем кажется (стабильно — на ответе про
+    /// передачу менеджеру). Сервер такой ответ хранит уже подрезанным, поэтому лишний перенос
+    /// жил только на устройстве: пузырь начинался с пустой строки, а догон ленты не узнавал в
+    /// нём свою же строку и клал серверную копию рядом — сообщение двоилось.
     public func updateAssistantContent(id: String, delta: String) {
         guard let idx = messages.firstIndex(where: { $0.id == id }) else { return }
-        messages[idx].content += delta
+        if messages[idx].content.isEmpty {
+            messages[idx].content += String(delta.drop(while: { $0.isWhitespace }))
+        } else {
+            messages[idx].content += delta
+        }
     }
 
+    /// Ответ дописан: хвостовые пробелы убираем — на сервере строка хранится без них.
     public func finalizeAssistant(id: String) {
         guard let idx = messages.firstIndex(where: { $0.id == id }) else { return }
         messages[idx].streaming = false
+        while let last = messages[idx].content.last, last.isWhitespace {
+            messages[idx].content.removeLast()
+        }
     }
 
     public func appendOperatorMessage(content: String, authorName: String?) {
@@ -158,8 +172,13 @@ public final class ChatStore: ObservableObject {
             if let sid = item.serverId, messages.contains(where: { $0.serverId == sid }) {
                 continue
             }
+            // Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов, а в
+            // потоке они приходят (первым чанком часто идёт перевод строки). Точное равенство
+            // роняло слияние в дубль ровно на таких ответах.
+            let itemKey = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if let localIdx = messages.lastIndex(where: {
-                $0.serverId == nil && $0.role == item.role && $0.content == item.content
+                $0.serverId == nil && $0.role == item.role
+                    && $0.content.trimmingCharacters(in: .whitespacesAndNewlines) == itemKey
             }) {
                 messages[localIdx].serverId = item.serverId
                 messages[localIdx].failed = false

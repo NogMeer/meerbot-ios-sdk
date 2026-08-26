@@ -83,6 +83,38 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertEqual(store.lastServerMessageId, 9)
     }
 
+    /// Регрессия: поток начинается с перевода строки (модель стабильно так отвечает на
+    /// передачу менеджеру), сервер хранит строку подрезанной. До правки слияние не узнавало
+    /// свой же ответ и клало серверную копию рядом — пользователь видел сообщение дважды.
+    func testОтветСПереводомСтрокиВНачалеПотокаНеДвоится() {
+        let store = ChatStore()
+        let placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(id: placeholder.id, delta: "\n")
+        store.updateAssistantContent(id: placeholder.id, delta: "Понимаю, сейчас подключу менеджера.")
+        store.finalizeAssistant(id: placeholder.id)
+
+        let added = store.mergeServerMessages(
+            [serverMessage(11, text: "Понимаю, сейчас подключу менеджера.")]
+        )
+
+        XCTAssertEqual(added, 0)
+        XCTAssertEqual(store.messages.count, 1)
+        XCTAssertEqual(store.messages.first?.serverId, 11)
+        XCTAssertEqual(store.messages.first?.content, "Понимаю, сейчас подключу менеджера.")
+    }
+
+    /// Хвостовые пробелы потока тоже не должны мешать слиянию.
+    func testХвостовойПереносСтрокиНеМешаетСлиянию() {
+        let store = ChatStore()
+        let placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(id: placeholder.id, delta: "Готово")
+        store.updateAssistantContent(id: placeholder.id, delta: "\n\n")
+        store.finalizeAssistant(id: placeholder.id)
+
+        XCTAssertEqual(store.mergeServerMessages([serverMessage(12, text: "Готово")]), 0)
+        XCTAssertEqual(store.messages.count, 1)
+    }
+
     func testВыходСбрасываетКурсор() {
         let store = ChatStore()
         store.mergeServerMessages([serverMessage(42, text: "a")])
