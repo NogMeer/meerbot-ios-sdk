@@ -139,12 +139,19 @@ final class ChatControllerCatchUpTests: XCTestCase {
         XCTAssertNil(controller.store.connectionError)
     }
 
+    /// Гарантия здесь — «после stop() НОВЫЕ циклы догона не начинаются», а не «сеть замирает
+    /// в ту же наносекунду». Запрос, отправленный до stop(), долетает: URLSession стартует
+    /// его не мгновенно (стенд считает запросы в `startLoading`), и снятая сразу после stop()
+    /// отметка не включала бы его — тест падал примерно раз на шесть прогонов.
+    /// Поэтому отметка снимается после паузы, достаточной, чтобы всё уже отправленное
+    /// долетело, а проверяется следующий за ней интервал.
     func testStopОстанавливаетДогон() async throws {
         let controller = try await started()
         stubHistory()
         try await Task.sleep(nanoseconds: 150_000_000)
 
         controller.stop()
+        try await Task.sleep(nanoseconds: 150_000_000)
         let afterStop = StubURLProtocol.requests(path: messagesPath).count
         try await Task.sleep(nanoseconds: 250_000_000)
 

@@ -227,10 +227,14 @@ public final class ChatController: ObservableObject {
     /// Во время отправки догон не идёт: серверная страница принесла бы половину ещё
     /// стримящегося ответа и подралась бы с плейсхолдером.
     private func catchUp(silent: Bool) async {
-        guard isReady, !store.sending else { return }
+        guard isReady, !store.sending, !Task.isCancelled else { return }
 
         do {
             for _ in 0..<Self.maxCatchUpPages {
+                // Отмена проверяется ПЕРЕД каждой страницей: закрытый экран не должен
+                // дочитывать длинную ленту. Уже отправленный запрос при этом долетит —
+                // оборвать его на полпути нечем, да и незачем: ответ просто отбрасывается.
+                if Task.isCancelled { return }
                 let cursor = store.lastServerMessageId
                 let page = try await client.history(since: cursor > 0 ? cursor : nil, limit: 50)
                 store.setMode(page.mode)
