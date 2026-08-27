@@ -15,9 +15,6 @@ verified identity. Не сделано: вложения, App Attest, cert pinni
 >
 > Коммит, сделанный прямо в зеркале, обратно не возвращается: следующий выпуск версии
 > соберёт срез **без него**, а до того момента релиз будет падать на `non-fast-forward`.
-> Push в зеркало ловит страж ([`.github/workflows/mirror-guard.yml`](.github/workflows/mirror-guard.yml))
-> и падает красным.
->
 > Уже поправили в зеркале? Верните правки в исходник — из чекаута `agentbot-platform`:
 > `scripts/sync-sdk-mirror-back.sh ios`.
 
