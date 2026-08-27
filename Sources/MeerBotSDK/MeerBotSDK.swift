@@ -13,7 +13,7 @@ import Foundation
 import SwiftUI
 
 public enum MeerBotPlatform {
-    public static let version = "0.2.7"
+    public static let version = "0.2.8"
     public static let apiBaseUrl = "https://meerbot.ru"
 }
 
@@ -125,7 +125,9 @@ public final class MeerBot {
     public func chatView(
         title: String = "Поддержка",
         primaryColor: Color = .blue,
-        onClose: (() -> Void)? = nil
+        onClose: (() -> Void)? = nil,
+        // false — хост показывает чат вкладкой и рисует заголовок сам.
+        showHeader: Bool = true
     ) -> some View {
         Group {
             if let controller {
@@ -133,7 +135,8 @@ public final class MeerBot {
                     controller: controller,
                     title: title,
                     primaryColor: primaryColor,
-                    onClose: onClose
+                    onClose: onClose,
+                    showHeader: showHeader
                 )
             } else {
                 NotConfiguredView()

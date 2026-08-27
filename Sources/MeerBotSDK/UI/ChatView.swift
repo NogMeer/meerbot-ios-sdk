@@ -4,6 +4,9 @@
 // ChatScreen и RN ChatScreen.
 
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 public struct ChatView: View {
 
@@ -14,6 +17,9 @@ public struct ChatView: View {
     private let title: String
     private let primaryColor: Color
     private let onClose: (() -> Void)?
+    /// Рисовать ли шапку (заголовок + крестик). `false` — когда чат открыт вкладкой хоста:
+    /// заголовок там уже есть в его навигации, а вторая полоса с тем же словом съедает высоту.
+    private let showHeader: Bool
 
     /// Фокус поля ввода. Живёт ЗДЕСЬ, а не в `ChatInput`: снимать его должен список
     /// сообщений по тапу, а из дочернего вью до чужого `@FocusState` не дотянуться.
@@ -25,29 +31,33 @@ public struct ChatView: View {
         controller: ChatController,
         title: String = "Поддержка",
         primaryColor: Color = .blue,
-        onClose: (() -> Void)? = nil
+        onClose: (() -> Void)? = nil,
+        showHeader: Bool = true
     ) {
         self.controller = controller
         self.store = controller.store
         self.title = title
         self.primaryColor = primaryColor
         self.onClose = onClose
+        self.showHeader = showHeader
     }
 
     public var body: some View {
         VStack(spacing: 0) {
-            ChatHeader(
-                title: title,
-                primaryColor: primaryColor,
-                onClose: {
-                    // Отклик — ДО закрытия: экран уезжает мгновенно, и вызванный после
-                    // генератор успел бы уйти из памяти вместе с вью.
-                    MBHaptics.lightImpact()
-                    onClose?()
-                    dismiss()
-                }
-            )
-            Divider()
+            if showHeader {
+                ChatHeader(
+                    title: title,
+                    primaryColor: primaryColor,
+                    onClose: {
+                        // Отклик — ДО закрытия: экран уезжает мгновенно, и вызванный после
+                        // генератор успел бы уйти из памяти вместе с вью.
+                        MBHaptics.lightImpact()
+                        onClose?()
+                        dismiss()
+                    }
+                )
+                Divider()
+            }
             MessagesList(store: store)
                 // ТАП по переписке убирает клавиатуру. Протягивания
                 // (`scrollDismissesKeyboard`) недостаточно: оно требует, чтобы списку было
@@ -200,6 +210,37 @@ struct MessagesList: View {
             // доехать туда); дальше новые сообщения — с анимацией, как в мессенджерах.
             jumpToBottom(proxy, animated: didInitialScroll)
         }
+        // Лента едет ВМЕСТЕ с клавиатурой.
+        //
+        // SwiftUI меняет высоту окна, но ПРОКРУТКУ не трогает: на выезде нижние сообщения
+        // уходят под поле ввода, на уходе лента остаётся задранной.
+        //
+        // Длительность берём из САМОГО уведомления, а не свою: чужой темп читается как рывок.
+        // По той же причине едем на `willChangeFrame` — вместе с системной анимацией, а не
+        // снапом после неё (`didChangeFrame`), который глаз ловит как скачок.
+        #if canImport(UIKit)
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIResponder.keyboardWillChangeFrameNotification
+        )) { note in
+            guard let last = store.messages.last else { return }
+            let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey]
+                as? Double ?? 0.25
+            didInitialScroll = true
+            withAnimation(.easeOut(duration: duration)) {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+            // Второй проход следующим тиком — из-за ПЕРВОГО показа клавиатуры. Уведомление
+            // приходит до того, как вставка применена к списку, и первый `scrollTo` считает
+            // по старой геометрии: лента и так внизу, делать ему нечего. Дальше содержимое
+            // уезжает под клавиатуру и остаётся там — на втором и следующих показах геометрия
+            // уже новая, поэтому баг ловился только на первом.
+            DispatchQueue.main.async {
+                withAnimation(.easeOut(duration: duration)) {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+        }
+        #endif
     }
 
     private func jumpToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
