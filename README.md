@@ -3,9 +3,23 @@
 Экран чата с ИИ-ассистентом MeerBot внутри вашего iOS-приложения: SwiftUI-вью, потоковые
 ответы (SSE), эскалация на менеджера, догон истории после обрыва связи, пуш-уведомления.
 
-**Статус:** `0.2.4` — рабочий чат на собственном канале платформы (`mobile_app`), один ключ,
+**Статус:** `0.2.6` — рабочий чат на собственном канале платформы (`mobile_app`), один ключ,
 verified identity. Не сделано: вложения, App Attest, cert pinning.
 См. [Границы](#границы-текущей-версии).
+
+> ### ⚠️ Правки — в `agentbot-platform`, не в репозитории `meerbot-ios-sdk`
+>
+> `github.com/NogMeer/meerbot-ios-sdk` — **зеркало**. Его содержимое целиком
+> перезаписывается срезом каталога `mobile-sdk-ios/` из приватного `agentbot-platform`,
+> откуда его публикует `scripts/release-ios-sdk.sh`.
+>
+> Коммит, сделанный прямо в зеркале, обратно не возвращается: следующий выпуск версии
+> соберёт срез **без него**, а до того момента релиз будет падать на `non-fast-forward`.
+> Push в зеркало ловит страж ([`.github/workflows/mirror-guard.yml`](.github/workflows/mirror-guard.yml))
+> и падает красным.
+>
+> Уже поправили в зеркале? Верните правки в исходник — из чекаута `agentbot-platform`:
+> `scripts/sync-sdk-mirror-back.sh ios`.
 
 > **0.2.0 ломает интеграцию 0.1.x.** Чат переехал с `/api/v1/widget/*` на `/api/v1/mobile/*`:
 > вместо двух ключей — один (мобильного приложения), `pushApiKey` и `origin` из `configure`
@@ -28,13 +42,13 @@ https://github.com/NogMeer/meerbot-ios-sdk
 ```
 
 В Xcode: **File → Add Package Dependencies…** → вставить URL → правило версии
-**Up to Next Minor `0.2.0`** (до 1.0 минорная версия может ломать контракт).
+**Up to Next Minor `0.2.6`** (до 1.0 минорная версия может ломать контракт).
 
 Или в `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/NogMeer/meerbot-ios-sdk.git", .upToNextMinor(from: "0.2.4"))
+    .package(url: "https://github.com/NogMeer/meerbot-ios-sdk.git", .upToNextMinor(from: "0.2.6"))
 ]
 ```
 
