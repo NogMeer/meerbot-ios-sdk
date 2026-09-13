@@ -43,6 +43,22 @@ public final class ChatController: ObservableObject {
     /// `await`: отмена не останавливает уже отправленный запрос, и без сверки его ответ —
     /// страница ПРЕЖНЕГО пользователя — лёг бы в только что очищенную ленту.
     private var identityEpoch = 0
+    /// Сколько смен identity начато (`beginIdentityChange`) и ещё не применено к `APIClient`.
+    ///
+    /// Между очисткой ленты и применением новой identity к клиенту есть `await`. Отправка,
+    /// начатая в это окно, ушла бы с ПРЕЖНЕЙ identity (или зарегистрировалась бы уже с новой
+    /// и попала в новый тред) — а сброс, пришедший следом, стёр бы её из ленты. Поэтому пока
+    /// счётчик не ноль, сеть не трогаем: отправка ждёт в `queuedSend`, старт — в `finish`.
+    private var pendingIdentityChanges = 0
+    /// Сообщение, отправленное, пока применялась смена identity. Уходит сразу после неё.
+    private var queuedSend: (text: String, userMessageId: String)?
+    /// Фоновый догон остановлен: сессию не восстановила даже перерегистрация (`device_*`,
+    /// `jwt_*` после повтора). Крутить его дальше — две регистрации и две истории каждые
+    /// 12 секунд без шанса на успех. Снимается явным действием: показ экрана, отправка,
+    /// `refresh()`.
+    private var catchUpSuspended = false
+    /// Номер текущей отправки — чтобы завершившаяся задача не обнулила ссылку на следующую.
+    private var streamRunId = 0
     private var lifecycleSubscriptions = Set<AnyCancellable>()
 
     /// Периоды догона — те же, что у веб-виджета. `var` ради тестов: они ужимают их до
@@ -84,7 +100,8 @@ public final class ChatController: ObservableObject {
 
     /// Приложение вернулось на передний план: догоняем немедленно, не дожидаясь тика.
     func onEnterForeground() {
-        guard screenVisible, isReady else { return }
+        // Возврат из фона — не действие пользователя в чате: остановленный догон не будим.
+        guard screenVisible, isReady, !catchUpSuspended else { return }
         Task { [weak self] in await self?.catchUp(silent: true) }
         startPolling()
     }
@@ -97,6 +114,11 @@ public final class ChatController: ObservableObject {
     /// Зарегистрировать устройство и подтянуть историю треда.
     public func start() {
         screenVisible = true
+        // Показ экрана — явное действие: даём догону ещё одну попытку.
+        catchUpSuspended = false
+        // Сессия поднимется, когда смена identity дойдёт до клиента (`finishIdentityChange`):
+        // сейчас регистрация ушла бы с прежней.
+        guard pendingIdentityChanges == 0 else { return }
         guard startTask == nil else { return }
 
         // Сессия уже поднята: контроллер живёт в синглтоне SDK и переживает закрытие экрана.
@@ -161,9 +183,15 @@ public final class ChatController: ObservableObject {
     /// диалог» здесь означает «подтянуть свежую ленту»: id из пуша только запоминается —
     /// чтобы приложение могло сверять его с открытым экраном — и в запрос не уходит.
     public func openConversation(id: Int) {
+        // Пуш пришёл посреди смены identity — он адресован прежнему человеку. Лента нового
+        // поднимется сама, когда смена применится.
+        guard pendingIdentityChanges == 0 else { return }
+        // Эпоха — на момент ВЫЗОВА: взятая внутри задачи, она оказалась бы уже новой, и id
+        // диалога прежнего пользователя лёг бы в сессию следующего.
+        let epoch = identityEpoch
         Task { [weak self] in
             guard let self else { return }
-            let epoch = self.identityEpoch
+            guard self.identityEpoch == epoch else { return }
             await self.client.setConversationId(id)
             guard self.identityEpoch == epoch else { return }
             self.conversationId = id
@@ -187,7 +215,13 @@ public final class ChatController: ObservableObject {
     /// Отличие от `openConversation(id:)`: тот ПЕРЕКЛЮЧАЕТ тред по id из пуша, этот просто
     /// перечитывает текущий. Паритет с Android (`MeerBot.refresh()`).
     public func refresh() {
-        Task { [weak self] in await self?.catchUp(silent: false) }
+        catchUpSuspended = false
+        Task { [weak self] in
+            guard let self else { return }
+            await self.catchUp(silent: false)
+            // Догон удался — возвращаем фоновый опрос, если его останавливал отказ сессии.
+            if self.screenVisible, self.isReady, !self.catchUpSuspended { self.startPolling() }
+        }
     }
 
     public func stop() {
@@ -198,31 +232,58 @@ public final class ChatController: ObservableObject {
         startTask?.cancel()
         startTask = nil
         store.setSending(false)
+        // Отправка ждала смены identity, а экран закрыли: уйти ей теперь не с чего. Молча
+        // пропасть она не имеет права — остаётся в ленте недоставленной, с «Повторить».
+        if let queued = queuedSend {
+            queuedSend = nil
+            store.setFailed(id: queued.userMessageId, true)
+            retryableText = queued.text
+        }
         // `isReady` СОЗНАТЕЛЬНО не сбрасываем: сессия остаётся живой, и следующее открытие
         // экрана обойдётся догоном вместо новой регистрации устройства.
     }
 
     /// Сменился пользователь (`MeerBot.identify`): переписка прежнего человека не должна
     /// остаться на экране. Задачи отменяются, лента чистится (приветствие хоста остаётся),
-    /// сессия считается закрытой. Открытый экран сразу переподключается — уже с новой
-    /// identity; закрытый в сеть не ходит и поднимет сессию при следующем показе.
+    /// сессия считается закрытой.
     ///
-    /// Вызывать ПОСЛЕ того, как новая identity применена к `APIClient`: иначе перезапуск
-    /// успел бы зарегистрироваться со старой.
-    func resetForIdentityChange() {
-        let wasVisible = screenVisible
+    /// Звать СИНХРОННО в момент смены, ДО применения identity к `APIClient`; после
+    /// применения — `finishIdentityChange()`. Между ними контроллер в сеть не ходит.
+    func beginIdentityChange() {
+        pendingIdentityChanges += 1
         identityEpoch += 1
         stopPolling()
         streamTask?.cancel()
         streamTask = nil
         startTask?.cancel()
         startTask = nil
+        // Сообщение, ждавшее прежнюю смену, написано при ленте, которую сейчас стираем, —
+        // в сессию следующего человека оно уйти не должно.
+        queuedSend = nil
         store.resetForIdentityChange()
         isReady = false
         retryableText = nil
         conversationId = nil
-        screenVisible = false
-        if wasVisible { start() }
+        catchUpSuspended = false
+    }
+
+    /// Новая identity применена к `APIClient`. Открытый экран переподключается уже с ней,
+    /// закрытый в сеть не ходит и поднимет сессию при следующем показе.
+    func finishIdentityChange() {
+        guard pendingIdentityChanges > 0 else { return }
+        pendingIdentityChanges -= 1
+        guard pendingIdentityChanges == 0 else { return }
+        if screenVisible { start() }
+        if let queued = queuedSend {
+            queuedSend = nil
+            run(text: queued.text, userMessageId: queued.userMessageId)
+        }
+    }
+
+    /// Смена identity целиком — для случаев, когда новая identity уже применена к клиенту.
+    func resetForIdentityChange() {
+        beginIdentityChange()
+        finishIdentityChange()
     }
 
     // MARK: - Догон ленты
@@ -264,7 +325,7 @@ public final class ChatController: ObservableObject {
     /// Во время отправки догон не идёт: серверная страница принесла бы половину ещё
     /// стримящегося ответа и подралась бы с плейсхолдером.
     private func catchUp(silent: Bool) async {
-        guard isReady, !store.sending, !Task.isCancelled else { return }
+        guard isReady, !store.sending, !catchUpSuspended, !Task.isCancelled else { return }
         let epoch = identityEpoch
 
         do {
@@ -284,22 +345,48 @@ public final class ChatController: ObservableObject {
             // «Повторить» вместе с сообщением о том, почему она там.
             if retryableText == nil { store.setError(nil) }
         } catch {
-            guard !silent, identityEpoch == epoch else { return }
+            guard identityEpoch == epoch else { return }
+            // Сессию не восстановила даже перерегистрация с повтором (они уже были внутри
+            // `history`). Следующий тик кончится тем же — останавливаемся и говорим об этом
+            // даже фоновому догону: иначе лента молча перестаёт обновляться.
+            if Self.isSessionLost(error) {
+                catchUpSuspended = true
+                stopPolling()
+                store.setError(Self.message(for: error))
+                return
+            }
+            guard !silent else { return }
             store.setError(Self.message(for: error))
         }
+    }
+
+    /// 401, который клиент уже пытался вылечить перерегистрацией (см.
+    /// `APIClient.isRecoverableBySession`), — до контроллера он доходит только после неудачи.
+    private static func isSessionLost(_ error: Error) -> Bool {
+        guard case let .http(status, code, _) = error as? MeerBotError else { return false }
+        return APIClient.isRecoverableBySession(status: status, code: code)
     }
 
     // MARK: - Поток
 
     private func run(text: String, userMessageId: String) {
+        if pendingIdentityChanges > 0 {
+            // Сообщение остаётся в ленте и уйдёт, как только смена identity применится
+            // (`finishIdentityChange`); `sending` не даёт отправить второе поверх.
+            queuedSend = (text, userMessageId)
+            store.setError(nil)
+            store.setSending(true)
+            return
+        }
         streamTask?.cancel()
         store.setError(nil)
         store.setSending(true)
         let placeholder = store.appendAssistantPlaceholder()
 
         let epoch = identityEpoch
-        var task: Task<Void, Never>?
-        task = Task { [weak self] in
+        streamRunId += 1
+        let runId = streamRunId
+        streamTask = Task { [weak self] in
             guard let self else { return }
             do {
                 for try await event in await self.client.sendMessage(text) {
@@ -312,6 +399,11 @@ public final class ChatController: ObservableObject {
                 self.store.finalizeAssistant(id: placeholder.id)
                 self.store.dropEmptyPlaceholder(id: placeholder.id)
                 self.store.setSending(false)
+                // Отправка прошла — сессия жива: снимаем остановку догона, если она была.
+                if self.catchUpSuspended {
+                    self.catchUpSuspended = false
+                    if self.screenVisible, self.isReady { self.startPolling() }
+                }
                 // Разовый догон сразу после потока: он проставляет серверные id только что
                 // отправленному сообщению и ответу. Без него первый же тик поллинга принёс бы
                 // обе строки как «новые», и слияние держалось бы на совпадении текста.
@@ -326,10 +418,11 @@ public final class ChatController: ObservableObject {
                 )
             }
             // Обнуляем ссылку, только если она всё ещё указывает на ЭТУ задачу: иначе
-            // отправка, начатая следом, потеряла бы возможность быть отменённой.
-            if self.streamTask == task { self.streamTask = nil }
+            // отправка, начатая следом, потеряла бы возможность быть отменённой. Сверка по
+            // номеру, а не по самой задаче: захват изменяемой ссылки на задачу в её же
+            // замыкании Swift 6 запрещает.
+            if self.streamRunId == runId { self.streamTask = nil }
         }
-        streamTask = task
     }
 
     private func handle(_ event: ChatStreamEvent, placeholderId: String) {
@@ -396,8 +489,11 @@ public final class ChatController: ObservableObject {
         store.finalizeAssistant(id: placeholderId)
         store.dropEmptyPlaceholder(id: placeholderId)
 
-        if let meerBotError = error as? MeerBotError, case .cancelled = meerBotError { return }
-        if error is CancellationError { return }
+        // Отмена безобидна, только если отменили САМУ отправку (`stop()`, новая отправка):
+        // смену identity отсекла сверка эпохи до вызова. `.cancelled` при живой задаче —
+        // это исчерпанные попытки регистрации: запрос не ушёл, и молча проглотить его
+        // значит потерять сообщение — ни доставленного, ни «Повторить».
+        if Task.isCancelled { return }
 
         store.setError(Self.message(for: error))
         let epoch = identityEpoch
@@ -464,7 +560,12 @@ public final class ChatController: ObservableObject {
     }
 
     private static func message(for error: Error) -> String {
-        (error as? MeerBotError)?.userMessage ?? MeerBotError
+        // До экрана `.cancelled` доходит только как несостоявшийся запрос (отмену самой
+        // задачи экран не показывает), и «Отменено.» пользователю ничего не объясняет.
+        if case .cancelled = error as? MeerBotError {
+            return "Запрос не выполнен. Попробуйте ещё раз."
+        }
+        return (error as? MeerBotError)?.userMessage ?? MeerBotError
             .network(code: .unknown, message: error.localizedDescription).userMessage
     }
 }

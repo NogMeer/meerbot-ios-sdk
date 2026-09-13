@@ -23,18 +23,22 @@ public final class MeerBot {
 
     public static let shared = MeerBot()
 
-    private var client: APIClient?
+    /// Хранилище идентификаторов, флага выхода и применённой identity. `.standard` у
+    /// синглтона; тестам — свой домен, чтобы прогон не оставлял следов.
+    private let defaults: UserDefaults
+    private(set) var client: APIClient?
     private var controller: ChatController?
     private var configuration: MeerBotConfiguration?
     private var visitorUuid: String?
     /// identity-токен, переданный до configure() — применим, как только появится клиент.
     /// Выход (`nil`) сюда не кладётся: он пишется флагом на диск и доходит сам.
     private var pendingIdentityToken: String?
-    /// Кто сейчас применён: `sub` токена (или сам токен, если `sub` не прочитать); `nil` —
-    /// аноним. По нему решается, сменился ли ЧЕЛОВЕК и надо ли чистить ленту.
-    private var appliedIdentityKey: String?
     /// Последнее применение identity. Следующее ждёт его: см. `identify(token:)`.
-    private var identityTask: Task<Void, Never>?
+    private(set) var identityTask: Task<Void, Never>?
+    /// Растёт в `reset()`. Применение identity, поставленное в очередь до сброса, сверяет его
+    /// после ожидания предыдущего: `Task.cancel()` само по себе ничего не останавливает, и
+    /// выход в очереди снова записал бы флаг, только что стёртый сбросом.
+    private var stateRevision = 0
 
     /// APNs-токен устройства, если хост его получил.
     ///
@@ -44,7 +48,13 @@ public final class MeerBot {
     /// уходит. См. `deviceToken` в шапке `APIClient`.
     public private(set) var pushToken: String?
 
-    private init() {}
+    private convenience init() {
+        self.init(defaults: .standard)
+    }
+
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+    }
 
     /// Настроить SDK.
     ///
@@ -66,34 +76,45 @@ public final class MeerBot {
         _ configuration: MeerBotConfiguration,
         sessionConfiguration: URLSessionConfiguration = APIClient.defaultSessionConfiguration()
     ) {
-        let visitorUuid = Self.getOrCreateVisitorUuid()
+        let visitorUuid = getOrCreateUuid(forKey: Self.visitorUuidKey)
         let client = APIClient(
             config: configuration,
             visitorUuid: visitorUuid,
-            installationId: Self.getOrCreateInstallationId(),
-            sessionConfiguration: sessionConfiguration
+            installationId: getOrCreateInstallationId(),
+            sessionConfiguration: sessionConfiguration,
+            flagStore: IdentityFlagStore(defaults: defaults)
         )
 
         self.configuration = configuration
         self.visitorUuid = visitorUuid
+        let controller = ChatController(client: client)
         self.client = client
-        self.controller = ChatController(client: client)
+        self.controller = controller
 
         // Регистрация здесь СОЗНАТЕЛЬНО не делается: она заводит строку `MobileDevice`, и
         // вызов на старте приложения записал бы «устройство» каждому, кто чат ни разу не
         // открыл. Сессия открывается при первом показе экрана; кому нужен прогрев —
         // preconnect().
 
+        // Смена, пришедшая до configure(), уже записана на диск (`recordIdentity`): флаг выхода
+        // лежит, лента нового контроллера пуста. Клиенту остаётся только получить токен.
         if let token = pendingIdentityToken {
             pendingIdentityToken = nil
-            identify(token: token)
+            enqueueIdentity(
+                token,
+                change: .subject(unlinkPrevious: false),
+                client: client,
+                controller: controller,
+                resetsFeed: false
+            )
         }
     }
 
     /// Связать чат с пользователем вашей системы.
     ///
     /// `token` — HS256-JWT, подписанный ВАШИМ бэкендом секретом этого приложения
-    /// (кабинет → Мобильные приложения → секрет подписи). Claims: `sub` — ваш id
+    /// (кабинет → Мобильные приложения → секрет для identity-токена; не путать с секретом
+    /// вебхука). Claims: `sub` — ваш id
     /// пользователя, `iat`/`exp`, опционально `email`/`name`. Токен обязан быть СВЕЖИМ —
     /// сервер устанавливает связь только по выпущенным не ранее пяти минут назад.
     ///
@@ -104,8 +125,10 @@ public final class MeerBot {
     /// Токен применяется НЕМЕДЛЕННО: текущая сессия сбрасывается, и следующий запрос
     /// перерегистрирует устройство уже с идентичностью. Результат проверки — в
     /// `identityStatus`; провал SOFT: чат продолжает работать анонимно. Если токен принадлежит
-    /// ДРУГОМУ пользователю (другой `sub`), лента на экране очищается; свежий токен того же
-    /// пользователя ленту не трогает.
+    /// ДРУГОМУ пользователю (другой `sub`), лента на экране очищается, а следующая регистрация
+    /// отвязывает устройство от прежнего — как при выходе, даже если токен нового сервер не
+    /// примет. Свежий токен того же пользователя ленту не трогает, в том числе после
+    /// перезапуска приложения (кто был применён, SDK помнит в виде хэша).
     ///
     /// `identify(token: nil)` — настоящий выход: с 0.2.9 SDK при следующем подключении
     /// отвязывает устройство на сервере (прежний тред остаётся за прежним пользователем,
@@ -114,9 +137,9 @@ public final class MeerBot {
     /// Вызывайте `nil` ТОЛЬКО на реальный выход, а не когда токен просто не успели получить:
     /// каждый такой вызов разрывает связь пользователя с его перепиской.
     public func identify(token: String?) {
-        // Флаг — ПЕРВЫМ и на диск: регистрация ленивая, и выход до configure() или выход,
-        // после которого приложение убили до первого показа чата, иначе потерялся бы.
-        if token == nil { IdentityFlagStore().logoutPending = true }
+        // Решение и флаг — ПЕРВЫМИ и на диск: регистрация ленивая, и выход (или смена
+        // человека) до configure() либо перед убийством приложения иначе потерялись бы.
+        let change = recordIdentity(token)
 
         guard let client, let controller else {
             pendingIdentityToken = token
@@ -126,22 +149,62 @@ public final class MeerBot {
         // Ленту чистим, только когда сменился ЧЕЛОВЕК. Токены живут минуты, и хост выпускает
         // свежий на каждый вход в чат: сравнение строк сбрасывало бы ленту (и обрывало
         // стримящийся ответ) на каждом таком вызове. Выход чистит всегда: связь могла
-        // остаться с прошлого запуска, когда `identify` в этом процессе ещё не звали.
-        let identityKey = token.map { Self.identitySubject(of: $0) ?? $0 }
-        let personChanged = token == nil || identityKey != appliedIdentityKey
-        appliedIdentityKey = identityKey
+        // остаться с прошлого запуска.
+        enqueueIdentity(
+            token,
+            change: change,
+            client: client,
+            controller: controller,
+            resetsFeed: change != .refresh
+        )
+    }
 
-        // Вызовы применяются строго по очереди: `identify(nil)` и следом `identify(token: B)`,
-        // исполненные в обратном порядке, оставили бы пользователя B анонимным.
+    /// Сравнить с тем, кто применён последним (между запусками — по хэшу на диске), и
+    /// записать новое состояние: кто применён и нужен ли выход.
+    private func recordIdentity(_ token: String?) -> IdentityChange {
+        let installationId = getOrCreateInstallationId()
+        let applied = AppliedIdentityStore(defaults: defaults)
+        let flags = IdentityFlagStore(defaults: defaults)
+        let previous = applied.current
+
+        guard let token else {
+            flags.markLogout(installationId: installationId)
+            applied.current = nil
+            return .logout
+        }
+
+        let subject = Self.identitySubject(of: token)
+        let digest = applied.digest(subject: subject ?? token, installationId: installationId)
+        if digest == previous { return .refresh }
+        applied.current = digest
+        // Рвём связь прежнего, только если и новый токен несёт `sub`. Токен без `sub` сервер
+        // отклоняет и связи по нему не ставит; флаг же на КАЖДЫЙ такой вызов (у них нет
+        // устойчивого ключа, и каждый выглядит сменой) уводил бы строку устройства в отставку
+        // и начинал новый тред раз за разом.
+        let unlinkPrevious = previous != nil && subject != nil
+        if unlinkPrevious { flags.markLogout(installationId: installationId) }
+        return .subject(unlinkPrevious: unlinkPrevious)
+    }
+
+    /// Вызовы применяются строго по очереди: `identify(nil)` и следом `identify(token: B)`,
+    /// исполненные в обратном порядке, оставили бы пользователя B анонимным.
+    private func enqueueIdentity(
+        _ token: String?,
+        change: IdentityChange,
+        client: APIClient,
+        controller: ChatController,
+        resetsFeed: Bool
+    ) {
+        // Лента чистится СРАЗУ, а контроллер до применения не ходит в сеть: сообщение,
+        // набранное в это окно, иначе ушло бы с прежней identity или стёрлось бы сбросом.
+        if resetsFeed { controller.beginIdentityChange() }
         let previous = identityTask
+        let revision = stateRevision
         identityTask = Task {
             await previous?.value
-            if let token {
-                await client.setIdentityToken(token)
-            } else {
-                await client.logout()
-            }
-            if personChanged { controller.resetForIdentityChange() }
+            guard self.stateRevision == revision, !Task.isCancelled else { return }
+            await client.applyIdentity(token, change: change)
+            if resetsFeed { controller.finishIdentityChange() }
         }
     }
 
@@ -231,6 +294,8 @@ public final class MeerBot {
     public func reset() {
         controller?.stop()
         controller?.store.resetForLogout()
+        // Сначала ревизия: задачи в очереди сверяют её и не применяют выход к прежнему клиенту.
+        stateRevision += 1
         identityTask?.cancel()
         identityTask = nil
         client = nil
@@ -238,12 +303,14 @@ public final class MeerBot {
         configuration = nil
         visitorUuid = nil
         pendingIdentityToken = nil
-        appliedIdentityKey = nil
         pushToken = nil
-        UserDefaults.standard.removeObject(forKey: Self.visitorUuidKey)
-        UserDefaults.standard.removeObject(forKey: Self.installationIdKey)
-        // Выход относился к прежней установке; новая с сервером ещё не связана.
-        IdentityFlagStore().logoutPending = false
+        defaults.removeObject(forKey: Self.visitorUuidKey)
+        defaults.removeObject(forKey: Self.installationIdKey)
+        // Выход относился к прежней установке; новая с сервером ещё не связана. Если
+        // применение, уже вошедшее в клиент, допишет флаг после этой строки, — он помечен
+        // прежней установкой, и новая его сотрёт, не отправив.
+        IdentityFlagStore(defaults: defaults).clearAll()
+        AppliedIdentityStore(defaults: defaults).current = nil
     }
 
     // MARK: - Внутреннее
@@ -251,21 +318,20 @@ public final class MeerBot {
     private static let visitorUuidKey = "meerbot.visitorUuid"
     private static let installationIdKey = "meerbot.installationId"
 
-    private static func getOrCreateVisitorUuid() -> String {
-        getOrCreateUuid(forKey: visitorUuidKey)
-    }
-
     /// Идентификатор установки — то, что уходит в `deviceToken` регистрации и через
     /// `MobileDevice.id` определяет тред. Отдельный ключ от `visitorUuid`: у них разные
     /// роли на сервере (один — колонка визитора, второй — ключ уникальности устройства), и
     /// склеенные они однажды разъедутся молча.
-    private static func getOrCreateInstallationId() -> String {
-        getOrCreateUuid(forKey: installationIdKey)
+    private func getOrCreateInstallationId() -> String {
+        getOrCreateUuid(forKey: Self.installationIdKey)
     }
 
     /// `sub` identity-токена — только чтобы понять, сменился ли человек. Подпись здесь не
     /// проверяется и не должна: связь устанавливает сервер, а по этому значению решается
     /// лишь, чистить ли ленту. `nil` — токен не JWT или `sub` в нём нет.
+    ///
+    /// Пробелы по краям обрезаются, как на сервере (`identity-token.ts`): иначе `" u1"` и
+    /// `"u1"` — один человек для сервера — выглядели бы здесь сменой и рвали его связь.
     nonisolated static func identitySubject(of token: String) -> String? {
         let parts = token.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3 else { return nil }
@@ -276,18 +342,18 @@ public final class MeerBot {
         guard
             let data = Data(base64Encoded: base64),
             let claims = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-            let subject = claims["sub"] as? String,
-            !subject.isEmpty
+            let rawSubject = claims["sub"] as? String
         else { return nil }
-        return subject
+        let subject = rawSubject.trimmingCharacters(in: .whitespacesAndNewlines)
+        return subject.isEmpty ? nil : subject
     }
 
-    private static func getOrCreateUuid(forKey key: String) -> String {
-        if let stored = UserDefaults.standard.string(forKey: key), stored.count == 36 {
+    private func getOrCreateUuid(forKey key: String) -> String {
+        if let stored = defaults.string(forKey: key), stored.count == 36 {
             return stored
         }
         let new = UUID().uuidString.lowercased()
-        UserDefaults.standard.set(new, forKey: key)
+        defaults.set(new, forKey: key)
         return new
     }
 }

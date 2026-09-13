@@ -13,16 +13,22 @@ final class ChatControllerCatchUpTests: XCTestCase {
     private let registerPath = "/api/v1/mobile/register"
     private let messagesPath = "/api/v1/mobile/messages"
 
-    override func setUp() {
-        super.setUp()
+    private var suiteName = ""
+    private var defaults = UserDefaults.standard
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         StubURLProtocol.reset()
         ChatController.managerPollInterval = 0.04
         ChatController.idlePollInterval = 0.04
+        suiteName = "MeerBotSDKTests.CatchUp.\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     }
 
     override func tearDown() {
         ChatController.managerPollInterval = 6
         ChatController.idlePollInterval = 12
+        defaults.removePersistentDomain(forName: suiteName)
         super.tearDown()
     }
 
@@ -35,7 +41,8 @@ final class ChatControllerCatchUpTests: XCTestCase {
                 ),
                 visitorUuid: "11111111-2222-4333-8444-555555555555",
                 installationId: "99999999-8888-4777-8666-555555555555",
-                sessionConfiguration: .stubbed()
+                sessionConfiguration: .stubbed(),
+                flagStore: IdentityFlagStore(defaults: defaults)
             )
         )
     }
@@ -173,6 +180,41 @@ final class ChatControllerCatchUpTests: XCTestCase {
         }
         XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 1)
         XCTAssertGreaterThan(StubURLProtocol.requests(path: messagesPath).count, historyBefore)
+    }
+
+    /// Устройство снято, и перерегистрация с повтором не помогают. Раньше фоновый догон
+    /// крутил две регистрации и две истории каждые 12 секунд без конца, а экран молчал.
+    func testСтойкийОтказУстройстваОстанавливаетДогонИГоворитОбЭтом() async throws {
+        let controller = try await started()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "error": ["type": "authentication_error", "code": "device_not_found", "message": "gone"],
+            ], status: 401)
+        )
+
+        try await waitUntil("баннера об ошибке сессии") { controller.store.connectionError != nil }
+        XCTAssertEqual(controller.store.connectionError, "Сессия недействительна. Откройте чат заново.")
+        // Даём долететь уже отправленному, затем проверяем несколько периодов тишины.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        let registers = StubURLProtocol.requests(path: registerPath).count
+        let histories = StubURLProtocol.requests(path: messagesPath).count
+        try await Task.sleep(nanoseconds: 300_000_000)
+        controller.onEnterForeground()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, registers, "перерегистраций больше нет")
+        XCTAssertEqual(StubURLProtocol.requests(path: messagesPath).count, histories, "догон остановлен")
+
+        // Повторное открытие экрана — явное действие: догон пробует снова и восстанавливается.
+        stubHistory([managerMessage(id: 12, text: "снова на связи")])
+        controller.stop()
+        controller.start()
+
+        try await waitUntil("догона после переоткрытия") {
+            controller.store.messages.contains { $0.content == "снова на связи" }
+        }
+        XCTAssertNil(controller.store.connectionError)
     }
 
     func testВозвратИзФонаПриЗакрытомЭкранеНичегоНеДелает() async throws {

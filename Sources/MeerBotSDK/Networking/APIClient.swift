@@ -35,6 +35,7 @@
 // Реальный APNs-токен остаётся у хост-приложения (`MeerBot.shared.pushToken`) и уходит на
 // бэкенд интегратора, который и шлёт пуш.
 
+import CryptoKit
 import Foundation
 
 // MARK: - Конфигурация
@@ -118,10 +119,11 @@ public enum MeerBotError: Error, LocalizedError {
                 // Токен от другого канала/устройства либо устройство снято с регистрации
                 // (например, выходом пользователя). `device_*` клиент переживает сам —
                 // перерегистрацией и одним повтором; до экрана они доходят, только если
-                // не помог и повтор.
-                return "Сессия недействительна. Переподключаемся…"
+                // не помог и повтор. Поэтому «Переподключаемся…» здесь было бы неправдой:
+                // переподключение уже было, а фоновый догон после такого отказа замирает.
+                return "Сессия недействительна. Откройте чат заново."
             case _ where status == 401:
-                return "Сессия истекла. Переподключаемся…"
+                return "Сессия истекла. Откройте чат заново."
             default:
                 return "Сервер недоступен (\(status)). Попробуйте ещё раз."
             }
@@ -218,6 +220,16 @@ public struct HistoryPage: Equatable {
 /// Снимается ТОЛЬКО подтверждением сервера (`identity.unlinked` в ответе регистрации).
 /// Сервер старше 0.2.9 поле `logout` молча игнорирует и `unlinked` не присылает — тогда
 /// флаг шлётся снова при каждой регистрации, пока сервер не обновится.
+///
+/// Значение — `<installationId>|<метка выхода>`, а не `true`:
+///   • идентификатор установки: выход относится к строке устройства ЭТОЙ установки. Флаг,
+///     оставшийся от прежней (`reset()`, гонка записи с ним), новой не касается — чужой
+///     флаг отвязал бы уже новую связь;
+///   • метка: снимать флаг можно только тем ответом, который его и вёз. Новый выход, записанный,
+///     пока регистрация летела, получает новую метку и переживает её ответ.
+///
+/// К ключу приложения флаг не привязан сознательно: выход бывает до `configure(...)`, когда
+/// ключа ещё нет, а строка устройства на сервере ключуется идентификатором установки.
 struct IdentityFlagStore {
     static let pendingLogoutKey = "meerbot.pendingLogout"
 
@@ -227,16 +239,72 @@ struct IdentityFlagStore {
         self.defaults = defaults
     }
 
-    var logoutPending: Bool {
-        get { defaults.bool(forKey: Self.pendingLogoutKey) }
+    /// Флаг этой установки — ровно в том виде, в каком он лежит (его и надо сверять при снятии).
+    /// Флаг другой установки стирается: применять его некуда, а хранить — значит однажды
+    /// применить не к той связи.
+    func pendingLogout(installationId: String) -> String? {
+        guard let raw = defaults.string(forKey: Self.pendingLogoutKey) else { return nil }
+        guard raw.hasPrefix(installationId + "|") else {
+            defaults.removeObject(forKey: Self.pendingLogoutKey)
+            return nil
+        }
+        return raw
+    }
+
+    func markLogout(installationId: String) {
+        defaults.set("\(installationId)|\(UUID().uuidString)", forKey: Self.pendingLogoutKey)
+    }
+
+    /// Снять флаг, только если он всё ещё тот, что ушёл на сервер.
+    func clearLogout(ifStill sent: String) {
+        guard defaults.string(forKey: Self.pendingLogoutKey) == sent else { return }
+        defaults.removeObject(forKey: Self.pendingLogoutKey)
+    }
+
+    func clearAll() {
+        defaults.removeObject(forKey: Self.pendingLogoutKey)
+    }
+}
+
+/// Кто применён последним — чтобы после перезапуска приложения первый `identify` того же
+/// человека не считался сменой (иначе он чистил бы ленту и обрывал ответ на каждом холодном
+/// старте).
+///
+/// Хранится SHA-256 от пары «установка + `sub`», а не сам `sub`: это id пользователя в
+/// системе интегратора, и лежать открытым текстом в `UserDefaults` (он попадает в бэкапы)
+/// ему незачем. Для сравнения хэша достаточно. Установка в хэше — по той же причине, что и у
+/// флага выхода: после `reset()` прежний человек к новой установке не относится.
+struct AppliedIdentityStore {
+    static let key = "meerbot.appliedIdentity"
+
+    let defaults: UserDefaults
+
+    func digest(subject: String, installationId: String) -> String {
+        let bytes = SHA256.hash(data: Data("\(installationId)\n\(subject)".utf8))
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    var current: String? {
+        get { defaults.string(forKey: Self.key) }
         nonmutating set {
-            if newValue {
-                defaults.set(true, forKey: Self.pendingLogoutKey)
+            if let newValue {
+                defaults.set(newValue, forKey: Self.key)
             } else {
-                defaults.removeObject(forKey: Self.pendingLogoutKey)
+                defaults.removeObject(forKey: Self.key)
             }
         }
     }
+}
+
+/// Как новый identity-токен соотносится с прежним.
+enum IdentityChange: Equatable {
+    /// Свежий токен того же человека: связь та же, лента та же.
+    case refresh
+    /// Другой человек или первый вход. `unlinkPrevious` — прежний был, и его связь с
+    /// устройством надо разорвать, даже если токен нового сервер не примет.
+    case subject(unlinkPrevious: Bool)
+    /// Выход.
+    case logout
 }
 
 // MARK: - Клиент
@@ -257,12 +325,22 @@ public actor APIClient {
     /// не выписывали по своему JWT (сервер держит jti-allowlist, лишние токены — мусор).
     private var refreshTask: Task<String, Error>?
 
-    /// Поколение identity: растёт при каждой смене токена и при выходе.
+    /// Поколение identity: растёт при смене ЧЕЛОВЕКА (другой `sub`, первый вход) и при выходе.
     ///
     /// Регистрация, отправленная ДО смены, возвращает JWT прежнего устройства — например,
     /// ещё связанного с вышедшим пользователем. Сохрани мы его, чат ходил бы под чужой
     /// связью до истечения токена. Ответ с устаревшим поколением отбрасывается целиком.
+    ///
+    /// Свежий токен ТОГО ЖЕ человека поколение не двигает. Хост выпускает токен на каждый
+    /// вход в чат, и два таких вызова во время отправки исчерпывали попытки регистрации —
+    /// сообщение не уходило. А отбрасывать там нечего: ответ описывает связь того же
+    /// человека. Для него есть `tokenRevision`.
     private var generation = 0
+    /// Ревизия токена: растёт на каждый `applyIdentity`, включая свежий токен того же `sub`.
+    /// Ответ регистрации, отправленной со старым токеном того же человека, запросу, который
+    /// её ждал, отдаётся, но НЕ кэшируется: иначе свежий токен (например, вместо устаревшего,
+    /// давшего `stale`) не дошёл бы до сервера, пока не истечёт выданный JWT.
+    private var tokenRevision = 0
     /// Сколько раз регистрация повторяется, если identity менялась, пока запрос летел.
     private static let maxRegisterAttempts = 2
 
@@ -326,10 +404,19 @@ public actor APIClient {
     /// только регистрацией, и следующий запрос её выполнит.
     ///
     /// `nil` здесь — «токена нет», а НЕ выход: связь на сервере остаётся. Выход — `logout()`.
+    ///
+    /// Смена человека определяется по `sub` против токена, заданного в ЭТОМ экземпляре.
+    /// Другой `sub` поверх прежнего токена — переключение: связь прежнего будет разорвана
+    /// следующей регистрацией. `MeerBot.identify` сравнивает с сохранённым между запусками.
     public func setIdentityToken(_ token: String?) {
-        identityToken = token
-        generation += 1
-        invalidateToken()
+        let change: IdentityChange
+        if let token, let current = identityToken,
+           Self.subjectKey(of: token) == Self.subjectKey(of: current) {
+            change = .refresh
+        } else {
+            change = .subject(unlinkPrevious: token != nil && identityToken != nil)
+        }
+        applyIdentity(token, change: change)
     }
 
     /// Пользователь вышел: следующая регистрация отвяжет устройство на сервере.
@@ -337,13 +424,36 @@ public actor APIClient {
     /// Флаг пишется на диск (см. `IdentityFlagStore`) и шлётся, пока сервер не подтвердит.
     /// Прежний тред остаётся за прежним пользователем, новая сессия начинается с пустой ленты.
     public func logout() {
-        identityToken = nil
-        flagStore.logoutPending = true
-        generation += 1
+        applyIdentity(nil, change: .logout)
+    }
+
+    /// Применить identity. Решение, КАКАЯ это смена, принимает вызывающий: только
+    /// `MeerBot` знает, кто был применён до перезапуска приложения.
+    func applyIdentity(_ token: String?, change: IdentityChange) {
+        identityToken = token
+        tokenRevision += 1
         invalidateToken()
+        switch change {
+        case .refresh:
+            return
+        case .subject(unlinkPrevious: true), .logout:
+            // Переключение без выхода тоже рвёт связь прежнего: иначе при токене нового,
+            // который сервер не принял (`stale`, `rejected`), устройство осталось бы за
+            // прежним человеком, и новый увидел бы его тред.
+            flagStore.markLogout(installationId: installationId)
+        case .subject(unlinkPrevious: false):
+            break
+        }
+        generation += 1
+        // Диалог, курсор и статус описывают прежнего человека.
         conversationId = nil
         lastMessageId = nil
         identityStatus = .notProvided
+    }
+
+    /// Ключ сравнения «тот же человек»: `sub`, а без него — сам токен.
+    static func subjectKey(of token: String) -> String {
+        MeerBot.identitySubject(of: token) ?? token
     }
 
     // MARK: Регистрация устройства (она же — открытие сессии)
@@ -353,8 +463,9 @@ public actor APIClient {
     /// новый токен — тред при этом ТОТ ЖЕ. Исключение — отложенный выход: регистрация с
     /// `logout: true` уводит связанную строку в отставку, и тред начинается новый.
     ///
-    /// Если identity сменилась, пока запрос летел, ответ отбрасывается и регистрация
-    /// повторяется; не успела и вторая — `MeerBotError.cancelled`.
+    /// Если сменился человек, пока запрос летел, ответ отбрасывается и регистрация
+    /// повторяется; не успела и вторая — `MeerBotError.cancelled`. Свежий токен того же
+    /// человека попыток не тратит (см. `generation`).
     @discardableResult
     public func openSession() async throws -> MobileSession {
         guard !config.apiKey.isEmpty else { throw MeerBotError.notConfigured }
@@ -370,7 +481,8 @@ public actor APIClient {
         // Поколение и флаг фиксируются на момент сборки тела: именно они описывают, ЧТО
         // сервер получил, а к ответу состояние актора может уже быть другим.
         let startedGeneration = generation
-        let logoutSent = flagStore.logoutPending
+        let startedRevision = tokenRevision
+        let logoutSent = flagStore.pendingLogout(installationId: installationId)
 
         var request = makeRequest(path: "/api/v1/mobile/register", method: "POST")
         var body: [String: Any] = [
@@ -384,7 +496,7 @@ public actor APIClient {
         if let identityToken { body["identityToken"] = identityToken }
         // Отдельное поле, а не `identityToken: null`: у сервера поле токена — строка, и
         // `null` вернул бы 400. Старый сервер незнакомое поле игнорирует.
-        if logoutSent { body["logout"] = true }
+        if logoutSent != nil { body["logout"] = true }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data = try await perform(request)
@@ -400,8 +512,12 @@ public actor APIClient {
         // `expiresIn` обязателен по контракту, но его отсутствие не повод падать: без него
         // токен считаем живым минуту — следующий запрос просто перевыпустит его.
         let expiresIn = (json["expiresIn"] as? Int) ?? 60
-        jwt = token
-        jwtExpiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        // Токен того же человека обновился в полёте: этот JWT отдаём ждущему запросу (связь
+        // та же), но не кэшируем — следующий запрос зарегистрируется уже со свежим токеном.
+        if tokenRevision == startedRevision {
+            jwt = token
+            jwtExpiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        }
 
         let identity = json["identity"] as? [String: Any]
         let status = (identity?["status"] as? String)
@@ -410,8 +526,9 @@ public actor APIClient {
 
         // Сервер 0.2.9+ присылает `unlinked` всегда — само его наличие значит «выход принят»
         // (значение `false` — отвязывать было нечего). Нет поля — сервер старый: флаг остаётся.
-        if logoutSent, identity?["unlinked"] is Bool {
-            flagStore.logoutPending = false
+        // Снимается только тот флаг, что ушёл в запросе: выход, записанный в полёте, остаётся.
+        if let logoutSent, identity?["unlinked"] is Bool {
+            flagStore.clearLogout(ifStill: logoutSent)
         }
 
         return MobileSession(

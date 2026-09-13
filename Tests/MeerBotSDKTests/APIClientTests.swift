@@ -32,6 +32,17 @@ final class APIClientTests: XCTestCase {
 
     private var flagStore: IdentityFlagStore { IdentityFlagStore(defaults: defaults) }
 
+    private var logoutPending: Bool { flagStore.pendingLogout(installationId: installationId) != nil }
+
+    /// Ждём, пока первая регистрация уйдёт в сеть (стенд пишет запрос до паузы ответа).
+    private func waitForRegisters(_ count: Int) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while StubURLProtocol.requests(path: registerPath).count < count, Date() < deadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, count, "регистрация в полёте")
+    }
+
     private func makeClient() -> APIClient {
         APIClient(
             config: MeerBotConfiguration(
@@ -228,7 +239,7 @@ final class APIClientTests: XCTestCase {
         _ = try await client.openSession()
 
         XCTAssertEqual(registerBodies().map { $0["logout"] as? Bool }, [true, nil])
-        XCTAssertFalse(flagStore.logoutPending)
+        XCTAssertFalse(logoutPending)
     }
 
     /// Старый сервер поле `logout` игнорирует и `unlinked` не присылает. Снять флаг по
@@ -244,19 +255,110 @@ final class APIClientTests: XCTestCase {
         _ = try await client.openSession()
 
         XCTAssertEqual(registerBodies().map { $0["logout"] as? Bool }, [true, true])
-        XCTAssertTrue(flagStore.logoutPending)
+        XCTAssertTrue(logoutPending)
     }
 
     /// Регистрация ленивая: выход до `configure()` или перед убийством приложения доходит
     /// только флагом на диске.
     func testФлагВыходаИзПрошлогоЗапускаУходитВПервуюРегистрацию() async throws {
-        defaults.set(true, forKey: IdentityFlagStore.pendingLogoutKey)
+        flagStore.markLogout(installationId: installationId)
         stubRegister(unlinked: true)
 
         _ = try await makeClient().openSession()
 
         XCTAssertEqual(registerBodies().first?["logout"] as? Bool, true)
-        XCTAssertFalse(flagStore.logoutPending)
+        XCTAssertFalse(logoutPending)
+    }
+
+    /// Флаг прежней установки (после `reset()` или гонки записи с ним) к новой не относится:
+    /// отправь его — сервер отвязал бы уже новую связь.
+    func testФлагДругойУстановкиНеУходитИСтирается() async throws {
+        flagStore.markLogout(installationId: "00000000-0000-4000-8000-000000000000")
+        stubRegister(unlinked: false)
+
+        _ = try await makeClient().openSession()
+
+        XCTAssertNil(registerBodies().first?["logout"])
+        XCTAssertNil(defaults.string(forKey: IdentityFlagStore.pendingLogoutKey))
+    }
+
+    /// Выход, записанный, пока летела регистрация с прежним выходом, её ответом не снимается:
+    /// сервер подтвердил тот, что получил, а не этот.
+    func testНовыйВыходЗаписанныйВПолётеНеСнимаетсяОтветомПрежнего() async throws {
+        flagStore.markLogout(installationId: installationId)
+        stubRegister(unlinked: true, delay: 0.3)
+        let client = makeClient()
+
+        async let session = client.openSession()
+        try await waitForRegisters(1)
+        flagStore.markLogout(installationId: installationId)
+        _ = try await session
+
+        XCTAssertTrue(logoutPending)
+    }
+
+    /// Ответ отброшен из-за смены identity — выход он не подтверждает, даже если нёс `unlinked`.
+    func testОтброшенныйОтветНеСнимаетФлаг() async throws {
+        stubRegister(jwt: "jwt-linked", unlinked: true, delay: 0.3)
+        stubRegister(jwt: "jwt-2") // старый сервер: `unlinked` нет
+        let client = makeClient()
+        await client.logout()
+
+        async let token = client.validToken()
+        try await waitForRegisters(1)
+        await client.setIdentityToken("token.of.b")
+        let value = try await token
+
+        XCTAssertEqual(value, "jwt-2")
+        XCTAssertEqual(registerBodies().map { $0["logout"] as? Bool }, [true, true])
+        XCTAssertTrue(logoutPending, "подтверждения, относящегося к текущей identity, не было")
+    }
+
+    /// Хост выпускает свежий токен на каждый вход в чат. Два таких вызова во время отправки
+    /// раньше исчерпывали попытки регистрации, и сообщение не уходило.
+    func testСвежийТокенТогоЖеЧеловекаНеОтбрасываетРегистрациюВПолёте() async throws {
+        stubRegister(jwt: "jwt-first", identityStatus: "stale", delay: 0.3)
+        stubRegister(jwt: "jwt-fresh", identityStatus: "verified")
+        let client = makeClient()
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-42", iat: 1))
+
+        async let token = client.validToken()
+        try await waitForRegisters(1)
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-42", iat: 2))
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-42", iat: 3))
+        let value = try await token
+
+        XCTAssertEqual(value, "jwt-first", "связь того же человека — ждущий запрос получает ответ")
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 1)
+
+        let next = try await client.validToken()
+        XCTAssertEqual(next, "jwt-fresh", "ответ со старым токеном не закэширован — свежий дошёл до сервера")
+        XCTAssertEqual(
+            registerBodies().last?["identityToken"] as? String,
+            makeIdentityJWT(sub: "user-42", iat: 3)
+        )
+        XCTAssertFalse(logoutPending, "обновление токена — не смена человека")
+    }
+
+    /// Другой `sub` поверх прежнего без выхода: связь прежнего рвётся, даже если токен
+    /// нового сервер не примет, — иначе новый увидел бы тред прежнего.
+    func testДругойЧеловекПоверхПрежнегоСтавитВыходИСбрасываетДиалог() async throws {
+        stubRegister(identityStatus: "stale", unlinked: true)
+        let client = makeClient()
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-a"))
+        XCTAssertFalse(logoutPending, "первый вход — рвать нечего")
+        await client.setConversationId(77)
+
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-b"))
+
+        XCTAssertTrue(logoutPending)
+        let conversationId = await client.conversationId
+        XCTAssertNil(conversationId, "диалог прежнего человека")
+        _ = try await client.openSession()
+        let body = try XCTUnwrap(registerBodies().first)
+        XCTAssertEqual(body["logout"] as? Bool, true)
+        XCTAssertEqual(body["identityToken"] as? String, makeIdentityJWT(sub: "user-b"))
+        XCTAssertFalse(logoutPending)
     }
 
     func testВыходИНовыйТокенУходятВОднойРегистрации() async throws {
@@ -280,11 +382,7 @@ final class APIClientTests: XCTestCase {
         let client = makeClient()
 
         async let token = client.validToken()
-        let deadline = Date().addingTimeInterval(5)
-        while StubURLProtocol.requests(path: registerPath).isEmpty, Date() < deadline {
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 1, "первая регистрация в полёте")
+        try await waitForRegisters(1)
 
         await client.logout()
         let value = try await token

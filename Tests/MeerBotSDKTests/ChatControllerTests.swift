@@ -11,23 +11,38 @@ final class ChatControllerTests: XCTestCase {
     private let streamPath = "/api/v1/mobile/chat/stream"
     private let messagesPath = "/api/v1/mobile/messages"
 
-    override func setUp() {
-        super.setUp()
+    /// Свой домен настроек: смена identity пишет флаг выхода на диск, и `.standard` пронёс
+    /// бы его в соседние тесты и следующий прогон.
+    private var suiteName = ""
+    private var defaults = UserDefaults.standard
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         StubURLProtocol.reset()
+        suiteName = "MeerBotSDKTests.ChatController.\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: suiteName)
+        super.tearDown()
+    }
+
+    private func makeClient() -> APIClient {
+        APIClient(
+            config: MeerBotConfiguration(
+                apiKey: "pk_live_test",
+                baseURL: URL(string: "https://meerbot.test")!
+            ),
+            visitorUuid: "11111111-2222-4333-8444-555555555555",
+            installationId: "99999999-8888-4777-8666-555555555555",
+            sessionConfiguration: .stubbed(),
+            flagStore: IdentityFlagStore(defaults: defaults)
+        )
     }
 
     private func makeController() -> ChatController {
-        ChatController(
-            client: APIClient(
-                config: MeerBotConfiguration(
-                    apiKey: "pk_live_test",
-                    baseURL: URL(string: "https://meerbot.test")!
-                ),
-                visitorUuid: "11111111-2222-4333-8444-555555555555",
-                installationId: "99999999-8888-4777-8666-555555555555",
-                sessionConfiguration: .stubbed()
-            )
-        )
+        ChatController(client: makeClient())
     }
 
     private func stubRegister() {
@@ -351,13 +366,6 @@ final class ChatControllerTests: XCTestCase {
         ["id": 2, "role": "assistant", "content": "Нашёл договор", "createdAt": "2026-09-01T10:00:01.000Z"],
     ]
 
-    private func makeSuiteDefaults() throws -> UserDefaults {
-        let suiteName = "MeerBotSDKTests.ChatController.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
-        return defaults
-    }
-
     func testСменаIdentityОчищаетЛентуИОткрытыйЭкранПереподключаетсяСВыходом() async throws {
         stubRegister()
         stubHistory(previousUserThread) // старт
@@ -368,13 +376,7 @@ final class ChatControllerTests: XCTestCase {
         StubURLProtocol.enqueue(path: messagesPath, latePushPage)
         stubHistory() // новый тред после выхода
 
-        let client = APIClient(
-            config: MeerBotConfiguration(apiKey: "pk_live_test", baseURL: URL(string: "https://meerbot.test")!),
-            visitorUuid: "11111111-2222-4333-8444-555555555555",
-            installationId: "99999999-8888-4777-8666-555555555555",
-            sessionConfiguration: .stubbed(),
-            flagStore: IdentityFlagStore(defaults: try makeSuiteDefaults())
-        )
+        let client = makeClient()
         let controller = ChatController(client: client)
         controller.store.setGreeting("Здравствуйте! Мы на связи.")
         controller.start()
@@ -437,5 +439,93 @@ final class ChatControllerTests: XCTestCase {
         XCTAssertEqual(MeerBot.identitySubject(of: jwt(#"{"sub":"user-42","iat":1}"#)), "user-42")
         XCTAssertNil(MeerBot.identitySubject(of: jwt(#"{"iat":1}"#)), "без sub — сравнение по токену")
         XCTAssertNil(MeerBot.identitySubject(of: "not-a-jwt"))
+        // Сервер обрезает `sub` (`identity-token.ts`): для него это один человек.
+        XCTAssertEqual(MeerBot.identitySubject(of: jwt(#"{"sub":"  user-42 \n","iat":1}"#)), "user-42")
+        XCTAssertNil(MeerBot.identitySubject(of: jwt(#"{"sub":"   ","iat":1}"#)))
+    }
+
+    // MARK: - Сообщение не теряется молча
+
+    /// Регистрация не успела дважды: identity сменили во время обеих попыток, а эпоха
+    /// контроллера та же (клиентом управляют напрямую). Раньше `.cancelled` глотался, и
+    /// отправленное сообщение не было ни доставлено, ни помечено.
+    func testИсчерпанныеПопыткиРегистрацииПомечаютСообщениеНедоставленным() async throws {
+        var slowRegister = StubResponse.json([
+            "deviceId": "42", "jwt": "jwt-1", "expiresIn": 900, "identity": ["status": "not_provided"],
+        ])
+        slowRegister.chunkDelay = 0.3
+        StubURLProtocol.enqueue(path: registerPath, slowRegister)
+        let client = makeClient()
+        let controller = ChatController(client: client)
+
+        controller.send("привет")
+        try await waitUntil("первой регистрации") { StubURLProtocol.requests(path: self.registerPath).count == 1 }
+        await client.setIdentityToken("token.of.a")
+        try await waitUntil("второй регистрации") { StubURLProtocol.requests(path: self.registerPath).count == 2 }
+        await client.setIdentityToken("token.of.b")
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(controller.retryableText, "привет")
+        XCTAssertEqual(controller.store.messages.first(where: { $0.role == "user" })?.failed, true)
+        XCTAssertEqual(controller.store.connectionError, "Запрос не выполнен. Попробуйте ещё раз.")
+        XCTAssertFalse(controller.store.sending)
+        XCTAssertTrue(StubURLProtocol.requests(path: streamPath).isEmpty)
+    }
+
+    /// Окно между очисткой ленты и применением identity к клиенту: сообщение из этого окна
+    /// раньше уходило с прежней identity (или в новый тред) и стиралось сбросом, пришедшим следом.
+    func testСообщениеВоВремяСменыIdentityЖдётЕёИНеСтирается() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(path: streamPath, .sse("data: {\"choices\":[{\"delta\":{\"content\":\"Ответ\"}}]}\n\ndata: [DONE]\n\n"))
+        stubHistory()
+        let controller = makeController()
+
+        controller.beginIdentityChange()
+        controller.send("привет")
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(controller.store.messages.map(\.content), ["привет"])
+        XCTAssertTrue(controller.store.sending, "второе сообщение поверх ждущего не отправить")
+        XCTAssertTrue(StubURLProtocol.requests.isEmpty, "до применения identity в сеть не ходим")
+
+        controller.finishIdentityChange()
+
+        try await waitUntil("ответа на ждавшее сообщение") {
+            controller.store.messages.last?.content == "Ответ" && !controller.store.sending
+        }
+        XCTAssertEqual(controller.store.messages.filter { $0.role == "user" }.map(\.content), ["привет"])
+    }
+
+    func testЗакрытиеЭкранаВоВремяСменыIdentityОставляетСообщениеКПовтору() async throws {
+        let controller = makeController()
+
+        controller.beginIdentityChange()
+        controller.send("привет")
+        controller.stop()
+        controller.finishIdentityChange()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(controller.retryableText, "привет")
+        XCTAssertEqual(controller.store.messages.first?.failed, true)
+        XCTAssertFalse(controller.store.sending)
+        XCTAssertTrue(StubURLProtocol.requests.isEmpty)
+    }
+
+    /// Эпоха берётся при ВЫЗОВЕ: взятая внутри задачи, она была бы уже новой, и id диалога
+    /// из пуша прежнему пользователю лёг бы в сессию следующего.
+    func testПушДоСменыIdentityНеОставляетIdДиалогаПрежнего() async throws {
+        stubRegister()
+        stubHistory()
+        let client = makeClient()
+        let controller = ChatController(client: client)
+
+        controller.openConversation(id: 55)
+        controller.resetForIdentityChange()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertNil(controller.conversationId)
+        let clientConversationId = await client.conversationId
+        XCTAssertNil(clientConversationId)
+        XCTAssertTrue(StubURLProtocol.requests(path: messagesPath).isEmpty)
     }
 }
