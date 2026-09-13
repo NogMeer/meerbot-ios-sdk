@@ -240,6 +240,9 @@ final class ChatControllerCatchUpTests: XCTestCase {
         XCTAssertNil(controller.store.connectionError)
     }
 
+    /// Отметка снимается после паузы — по той же причине, что в `testStopОстанавливаетДогон`:
+    /// догон, отправленный до stop(), стенд засчитывает не сразу, и равенство счётчиков
+    /// выполнялось до его появления. На CI тест так и падал: 2 запроса вместо 1.
     func testВозвратИзФонаПриЗакрытомЭкранеНичегоНеДелает() async throws {
         let controller = try await started()
         controller.stop()
@@ -247,6 +250,7 @@ final class ChatControllerCatchUpTests: XCTestCase {
             StubURLProtocol.completed(path: self.messagesPath)
                 == StubURLProtocol.requests(path: self.messagesPath).count
         }
+        try await Task.sleep(nanoseconds: 150_000_000)
         let afterStop = StubURLProtocol.requests(path: messagesPath).count
 
         controller.onEnterForeground()
