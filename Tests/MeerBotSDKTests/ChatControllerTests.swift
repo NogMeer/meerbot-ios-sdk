@@ -511,6 +511,231 @@ final class ChatControllerTests: XCTestCase {
         XCTAssertTrue(StubURLProtocol.requests.isEmpty)
     }
 
+    // MARK: - Отправка до прихода стартовой истории
+
+    // Пользователь пишет сразу, как открылся экран, а стартовая история ещё летит. До правки
+    // её ответ ЗАМЕНЯЛ ленту: отправленное сообщение и стримящийся ответ пропадали с экрана
+    // (при том что сообщение могло уже дойти до сервера).
+
+    private func now(offset: TimeInterval = 0) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date().addingTimeInterval(offset))
+    }
+
+    private func gatedHistory(_ messages: [[String: Any]], gate: StubGate) -> StubResponse {
+        var page = StubResponse.json(["messages": messages, "hasMore": false, "mode": "ai"])
+        page.gate = gate
+        return page
+    }
+
+    private func contents(_ controller: ChatController) -> [String] {
+        controller.store.messages.map(\.content)
+    }
+
+    func testСообщениеОтправленноеДоПриходаИсторииНеПропадает() async throws {
+        stubRegister()
+        let historyGate = StubGate()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            gatedHistory(previousUserThread, gate: historyGate),
+            // Догон сразу после потока: сервер вернул эхо сообщения и ответ со своими id.
+            .json([
+                "messages": [
+                    ["id": 3, "role": "user", "content": "привет", "createdAt": now()],
+                    ["id": 4, "role": "assistant", "content": "Ответ", "createdAt": now()],
+                ],
+                "hasMore": false,
+                "mode": "ai",
+            ])
+        )
+        let streamGate = StubGate()
+        var reply = StubResponse.sse("data: {\"choices\":[{\"delta\":{\"content\":\"Ответ\"}}]}\n\ndata: [DONE]\n\n")
+        reply.gate = streamGate
+        StubURLProtocol.enqueue(path: streamPath, reply)
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("запроса стартовой истории") {
+            StubURLProtocol.requests(path: self.messagesPath).count == 1
+        }
+        controller.send("привет")
+        try await waitUntil("запроса потока") { StubURLProtocol.requests(path: self.streamPath).count == 1 }
+
+        historyGate.open()
+        try await waitUntil("применения истории") { controller.isReady }
+
+        XCTAssertEqual(
+            contents(controller),
+            ["мой номер договора 123", "Нашёл договор", "привет", ""],
+            "история встаёт ПЕРЕД отправленным сообщением и стримящимся ответом, а не вместо них"
+        )
+        XCTAssertTrue(controller.store.sending)
+        XCTAssertEqual(controller.store.messages.last?.streaming, true)
+
+        streamGate.open()
+        try await waitUntil("эха сообщения и ответа с сервера") {
+            controller.store.messages.map(\.serverId) == [1, 2, 3, 4]
+        }
+        XCTAssertEqual(contents(controller), ["мой номер договора 123", "Нашёл договор", "привет", "Ответ"])
+        XCTAssertFalse(controller.store.sending)
+        XCTAssertEqual(controller.store.lastServerMessageId, 4)
+    }
+
+    /// Отправка дошла до сервера раньше, чем он собрал стартовую историю: эхо уже в ней.
+    func testЭхоСообщенияВСтартовойИсторииНеДвоитЕго() async throws {
+        stubRegister()
+        let historyGate = StubGate()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            gatedHistory(
+                previousUserThread + [
+                    ["id": 3, "role": "user", "content": "привет", "createdAt": now()],
+                    ["id": 4, "role": "assistant", "content": "Ответ", "createdAt": now()],
+                ],
+                gate: historyGate
+            )
+        )
+        StubURLProtocol.enqueue(path: streamPath, .sse("data: {\"choices\":[{\"delta\":{\"content\":\"Ответ\"}}]}\n\ndata: [DONE]\n\n"))
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("запроса стартовой истории") {
+            StubURLProtocol.requests(path: self.messagesPath).count == 1
+        }
+        controller.send("привет")
+        let local = try XCTUnwrap(controller.store.messages.first)
+        try await waitUntil("завершения ответа") {
+            !controller.store.sending && controller.store.messages.last?.content == "Ответ"
+        }
+
+        historyGate.open()
+        try await waitUntil("применения истории") { controller.isReady }
+
+        XCTAssertEqual(contents(controller), ["мой номер договора 123", "Нашёл договор", "привет", "Ответ"])
+        XCTAssertEqual(controller.store.messages.map(\.serverId), [1, 2, 3, 4])
+        XCTAssertEqual(
+            controller.store.messages.first { $0.serverId == 3 }?.id,
+            local.id,
+            "строка та же — SwiftUI не перерисует её как новую"
+        )
+    }
+
+    func testНедоставленноеСообщениеПереживаетСтартовуюИсторию() async throws {
+        stubRegister()
+        let historyGate = StubGate()
+        StubURLProtocol.enqueue(path: messagesPath, gatedHistory(previousUserThread, gate: historyGate))
+        var dropped = StubResponse.sse("")
+        dropped.failure = URLError(.networkConnectionLost)
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("запроса стартовой истории") {
+            StubURLProtocol.requests(path: self.messagesPath).count == 1
+        }
+        controller.send("привет")
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+
+        historyGate.open()
+        try await waitUntil("применения истории") { controller.isReady }
+
+        XCTAssertEqual(contents(controller), ["мой номер договора 123", "Нашёл договор", "привет"])
+        XCTAssertEqual(controller.store.messages.last?.failed, true)
+        XCTAssertEqual(controller.retryableText, "привет", "«Повторить» не осталось без сообщения")
+    }
+
+    /// Обрыв ДО того, как сервер записал сообщение, в уже заведённом диалоге: история
+    /// кончается прошлым ответом бота. До правки это считалось «ответ дописан», лента
+    /// заменялась, и сообщение пропадало без «Повторить».
+    func testОбрывДоЗаписиСообщенияНеПринимаетсяЗаДоставку() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse("event: meta\ndata: {\"conversationId\":31,\"mode\":\"ai\"}\n\n")
+        dropped.failure = URLError(.networkConnectionLost)
+        dropped.chunkDelay = 0.05
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+        stubHistory(previousUserThread)
+
+        let controller = makeController()
+        controller.send("привет")
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(contents(controller), ["мой номер договора 123", "Нашёл договор", "привет"])
+        XCTAssertEqual(controller.store.messages.last?.failed, true)
+    }
+
+    /// Плановый рестарт сервера посреди ответа: сервер ответ дописал. История теперь
+    /// вливается, а не заменяет ленту, — недописанный пузырь не должен остаться рядом с
+    /// серверной версией ответа.
+    func testРестартСервераПосредиОтветаНеДвоитОтвет() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: streamPath,
+            .sse(
+                """
+                data: {"choices":[{"delta":{"content":"Частичный"}}]}
+
+                event: shutdown
+                data: {"reason":"server_restart"}
+
+
+                """
+            )
+        )
+        stubHistory([
+            ["id": 1, "role": "user", "content": "привет", "createdAt": now()],
+            ["id": 2, "role": "assistant", "content": "Частичный ответ целиком", "createdAt": now()],
+        ])
+
+        let controller = makeController()
+        controller.send("привет")
+
+        try await waitUntil("сверки с сервером после рестарта") {
+            self.contents(controller) == ["привет", "Частичный ответ целиком"]
+        }
+        XCTAssertEqual(controller.store.messages.map(\.serverId), [1, 2])
+        XCTAssertNil(controller.retryableText)
+    }
+
+    /// Смена identity по-прежнему стирает и ждущие отправки: они написаны прежним человеком.
+    func testСменаIdentityСтираетСообщениеОтправленноеДоИстории() async throws {
+        stubRegister()
+        let historyGate = StubGate()
+        StubURLProtocol.enqueue(path: messagesPath, gatedHistory(previousUserThread, gate: historyGate))
+        stubHistory() // тред после смены
+        let streamGate = StubGate()
+        var reply = StubResponse.sse("data: {\"choices\":[{\"delta\":{\"content\":\"Ответ\"}}]}\n\ndata: [DONE]\n\n")
+        reply.gate = streamGate
+        StubURLProtocol.enqueue(path: streamPath, reply)
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("запроса стартовой истории") {
+            StubURLProtocol.requests(path: self.messagesPath).count == 1
+        }
+        controller.send("привет")
+        try await waitUntil("запроса потока") { StubURLProtocol.requests(path: self.streamPath).count == 1 }
+
+        controller.resetForIdentityChange()
+
+        XCTAssertTrue(controller.store.messages.isEmpty, "ждущее сообщение прежнего человека стёрто сразу")
+        XCTAssertFalse(controller.store.sending)
+        XCTAssertNil(controller.retryableText)
+
+        try await waitUntil("переподключения") { controller.isReady }
+        historyGate.open()
+        streamGate.open()
+        try await waitUntil("запоздалых ответов прежней identity") {
+            StubURLProtocol.completed(path: self.messagesPath) == 2
+                && StubURLProtocol.completed(path: self.streamPath) == 1
+        }
+        // Тело ответа уже отдано транспорту, но до ленты его ещё несут актор клиента и
+        // главный актор — хука «ответ отброшен» у контроллера нет. Пауза покрывает эти
+        // переходы с запасом на порядок.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(controller.store.messages.isEmpty, "запоздалые история и поток в новую ленту не легли")
+    }
+
     /// Эпоха берётся при ВЫЗОВЕ: взятая внутри задачи, она была бы уже новой, и id диалога
     /// из пуша прежнему пользователю лёг бы в сессию следующего.
     func testПушДоСменыIdentityНеОставляетIdДиалогаПрежнего() async throws {

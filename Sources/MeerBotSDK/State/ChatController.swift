@@ -393,7 +393,7 @@ public final class ChatController: ObservableObject {
                     // Смена identity отменяет задачу, но кадр, уже лежащий в буфере потока,
                     // мог бы дойти — в ленту нового пользователя.
                     guard self.identityEpoch == epoch else { return }
-                    self.handle(event, placeholderId: placeholder.id)
+                    self.handle(event, userMessageId: userMessageId, placeholderId: placeholder.id)
                 }
                 guard self.identityEpoch == epoch else { return }
                 self.store.finalizeAssistant(id: placeholder.id)
@@ -425,7 +425,7 @@ public final class ChatController: ObservableObject {
         }
     }
 
-    private func handle(_ event: ChatStreamEvent, placeholderId: String) {
+    private func handle(_ event: ChatStreamEvent, userMessageId: String, placeholderId: String) {
         switch event {
         case let .meta(id, mode):
             // Первое сообщение в новом треде: диалог заводит сервер и сообщает его id
@@ -468,9 +468,15 @@ public final class ChatController: ObservableObject {
 
         case .shutdown:
             // Плановый рестарт сервера — не сетевой сбой. Ответ уже могли дописать в БД.
+            // История вливается, а не заменяет ленту, поэтому недописанный пузырь убираем
+            // сами, если сервер ответ дописал. Смена identity между этими шагами безопасна:
+            // `loadHistory` сверяет эпоху, а id сообщений прежней ленты в новой не найдутся.
             store.finalizeAssistant(id: placeholderId)
             store.setSending(false)
-            Task { try? await self.loadHistory() }
+            Task {
+                try? await self.loadHistory()
+                _ = self.settleInterruptedReply(userMessageId: userMessageId, placeholderId: placeholderId)
+            }
 
         case .unknown:
             break
@@ -499,14 +505,15 @@ public final class ChatController: ObservableObject {
         let epoch = identityEpoch
 
         // Диалог мог быть уже заведён, а ответ — дописан сервером, пока рвалось соединение.
-        // Серверную ленту принимаем ТОЛЬКО если она заканчивается ответом: иначе замена
-        // выбросила бы из UI недоставленное сообщение пользователя.
-        if await client.conversationId != nil,
-           let items = try? await fetchHistory(),
-           items.last?.role == "assistant" {
+        // Историю вливаем, а доставкой считаем только эхо ЭТОГО сообщения с ответом после
+        // него. Раньше хватало «лента кончается ответом»: прошлый ответ бота выдавал
+        // недошедшее сообщение за доставленное, замена ленты убирала его, и «Повторить» не было.
+        if await client.conversationId != nil, let items = try? await fetchHistory() {
             guard identityEpoch == epoch else { return }
-            store.replaceAll(items)
-            return
+            store.mergeServerMessages(items)
+            if settleInterruptedReply(userMessageId: userMessageId, placeholderId: placeholderId) {
+                return
+            }
         }
         guard identityEpoch == epoch else { return }
 
@@ -514,7 +521,12 @@ public final class ChatController: ObservableObject {
         retryableText = text
     }
 
-    /// Догон истории: сервер — источник правды, локальную ленту заменяем целиком.
+    /// Полная история треда, ВЛИТАЯ в ленту.
+    ///
+    /// Не замена: пользователь пишет, как только открылся экран, и ответ стартовой истории
+    /// приходит уже после отправки. Замена убирала с экрана отправленное сообщение и
+    /// стримящийся ответ — при том что сообщение могло уже дойти до сервера. Слияние
+    /// сохраняет неподтверждённые строки, узнаёт эхо своих и ставит историю над ними.
     ///
     /// Режим применяется ДАЖЕ при пустой ленте: «диалог у менеджера» — это состояние треда,
     /// а не свойство сообщений, и пропусти мы его, экран предлагал бы писать боту, который
@@ -524,13 +536,28 @@ public final class ChatController: ObservableObject {
         let page = try await client.history()
         guard identityEpoch == epoch else { return }
         store.setMode(page.mode)
-        let items = Self.map(page.messages)
-        guard !items.isEmpty else { return }
-        store.replaceAll(items)
+        store.mergeServerMessages(Self.map(page.messages))
     }
 
-    /// Полный тред диалога с сервера (не инкремент — иначе замена ленты обрезала бы её
-    /// до пары последних сообщений).
+    /// Сервер дописал ответ на прерванную отправку: сообщение получило серверный id, и после
+    /// него есть серверный ответ. Недописанный локальный пузырь тогда лишний — серверная
+    /// версия ответа уже в ленте, и без удаления пользователь видел бы ответ дважды.
+    ///
+    /// Звать ПОСЛЕ слияния полной истории.
+    private func settleInterruptedReply(userMessageId: String, placeholderId: String) -> Bool {
+        let feed = store.messages
+        guard
+            let userServerId = feed.first(where: { $0.id == userMessageId })?.serverId,
+            feed.contains(where: { $0.role == "assistant" && ($0.serverId ?? 0) > userServerId })
+        else { return false }
+        if feed.first(where: { $0.id == placeholderId })?.serverId == nil {
+            store.removeMessage(id: placeholderId)
+        }
+        return true
+    }
+
+    /// Полный тред диалога с сервера (не инкремент: сверка «ответ дописан» смотрит на
+    /// строки после сообщения, и обрезанная страница их бы не содержала).
     private func fetchHistory() async throws -> [ChatMessage] {
         Self.map(try await client.history().messages)
     }

@@ -115,6 +115,96 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertEqual(store.messages.count, 1)
     }
 
+    // MARK: - Порядок относительно неподтверждённых сообщений
+
+    private func olderServerMessage(_ id: Int, role: String = "assistant", text: String) -> ChatMessage {
+        ChatMessage(
+            serverId: id,
+            role: role,
+            content: text,
+            timestamp: Date().addingTimeInterval(-86_400)
+        )
+    }
+
+    /// Стартовая история пришла после отправки: её строки старше ждущего сообщения.
+    func testСтраницаСтарееЖдущегоСообщенияВстаётПередНим() {
+        let store = ChatStore()
+        store.appendUserMessage("привет")
+        let placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(id: placeholder.id, delta: "Отве")
+
+        let added = store.mergeServerMessages([
+            olderServerMessage(1, role: "user", text: "вчера"),
+            olderServerMessage(2, text: "ответ вчера"),
+        ])
+
+        XCTAssertEqual(added, 2)
+        XCTAssertEqual(store.messages.map(\.content), ["вчера", "ответ вчера", "привет", "Отве"])
+        XCTAssertEqual(store.messages.last?.id, placeholder.id, "поток продолжает писать в тот же пузырь")
+        XCTAssertEqual(store.messages.last?.streaming, true)
+    }
+
+    /// Стримящийся пузырь ещё дописывается: промоут снял бы `streaming`, а серверная строка
+    /// с тем же текстом — не его окончательная версия.
+    func testСтримящийсяОтветНеПромоутится() {
+        let store = ChatStore()
+        let placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(id: placeholder.id, delta: "Готово")
+
+        store.mergeServerMessages([olderServerMessage(5, text: "Готово")])
+
+        let bubble = store.messages.first { $0.id == placeholder.id }
+        XCTAssertNil(bubble?.serverId)
+        XCTAssertEqual(bubble?.streaming, true)
+        XCTAssertEqual(store.messages.count, 2)
+    }
+
+    /// Пользователь повторил вчерашний текст. Эхо — самая новая строка с этим текстом;
+    /// вчерашняя не должна «съесть» ждущее сообщение.
+    func testЭхоЗабираетСамаяНоваяСтрокаСТемЖеТекстом() {
+        let store = ChatStore()
+        let local = store.appendUserMessage("ок")
+
+        store.mergeServerMessages([
+            olderServerMessage(1, role: "user", text: "ок"),
+            olderServerMessage(2, text: "Принято"),
+            serverMessage(3, role: "user", text: "ок"),
+        ])
+
+        XCTAssertEqual(store.messages.map(\.serverId), [1, 2, 3])
+        XCTAssertEqual(store.messages.last?.id, local.id)
+    }
+
+    /// Порядок между серверными строками — по серверному id, даже если страница пришла
+    /// после неподтверждённого сообщения, которое старше части из них.
+    func testСерверныеСтрокиВстаютПоIdВокругНедоставленного() {
+        let store = ChatStore()
+        store.mergeServerMessages([olderServerMessage(1, role: "user", text: "a"), olderServerMessage(2, text: "b")])
+        let failed = store.appendUserMessage("не ушло")
+        store.setFailed(id: failed.id, true)
+
+        store.mergeServerMessages([serverMessage(5, text: "менеджер ответил")])
+        store.mergeServerMessages([olderServerMessage(4, text: "пропущенная строка")])
+
+        XCTAssertEqual(
+            store.messages.map(\.content),
+            ["a", "b", "пропущенная строка", "не ушло", "менеджер ответил"]
+        )
+    }
+
+    func testСбросIdentityСтираетНеподтверждённыеСообщения() {
+        let store = ChatStore()
+        store.mergeServerMessages([serverMessage(1, text: "a")])
+        let failed = store.appendUserMessage("не ушло")
+        store.setFailed(id: failed.id, true)
+        store.appendAssistantPlaceholder()
+
+        store.resetForIdentityChange()
+
+        XCTAssertTrue(store.messages.isEmpty)
+        XCTAssertEqual(store.lastServerMessageId, 0)
+    }
+
     func testВыходСбрасываетКурсор() {
         let store = ChatStore()
         store.mergeServerMessages([serverMessage(42, text: "a")])

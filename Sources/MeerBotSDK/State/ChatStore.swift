@@ -146,20 +146,32 @@ public final class ChatStore: ObservableObject {
         messages.removeAll { $0.id == id }
     }
 
-    /// Заменить всю ленту (догон истории с сервера после обрыва — сервер источник правды).
+    /// Заменить всю ленту.
+    ///
+    /// ⚠️ Стирает и неподтверждённые сообщения (отправляемое, недоставленное). SDK сам этот
+    /// метод не зовёт: история вливается через `mergeServerMessages`, иначе ответ истории,
+    /// пришедший после отправки, убирал бы отправленное сообщение с экрана.
     public func replaceAll(_ items: [ChatMessage]) {
         messages = items
         bumpCursor(items)
     }
 
-    /// Влить серверную страницу в ленту. Идемпотентно по `serverId`.
+    /// Влить серверную страницу в ленту — и догон `since`, и полную историю. Идемпотентно
+    /// по `serverId`; неподтверждённые локальные сообщения не пропадают никогда.
     ///
-    /// Три случая, и порядок между ними важен:
+    /// Два прохода, и порядок между ними важен.
+    ///
+    /// Проход 1, от новых строк страницы к старым — узнать своё:
     ///   1. `serverId` уже в ленте — пропускаем (страница пришла повторно, это норма догона);
     ///   2. есть локальный двойник (тот же `role` и текст, ещё без серверного id) — ПРОМОУТИМ
-    ///      его, а не добавляем второй: иначе своё же сообщение пользователь увидит дважды,
-    ///      как только догон принесёт его с сервера;
-    ///   3. иначе — новое сообщение, добавляем в конец.
+    ///      его, а не добавляем второй: иначе своё же сообщение пользователь увидит дважды.
+    ///      Идём от новых к старым, чтобы эхо забрала самая новая строка с этим текстом, а не
+    ///      вчерашнее «ок» из полной истории. Стримящийся пузырь не промоутим: он ещё
+    ///      дописывается, и серверная строка с тем же текстом — не его окончательная версия.
+    ///
+    /// Проход 2, по порядку страницы — вставить остальное на своё место (см. `insertionIndex`),
+    /// а не в конец: стартовая история, пришедшая после отправки, старше отправленного
+    /// сообщения и должна встать над ним.
     ///
     /// Курсор двигается ВСЕГДА, даже если вся страница пропущена: иначе следующий догон
     /// запросил бы те же строки и цикл никогда бы не сдвинулся.
@@ -167,9 +179,10 @@ public final class ChatStore: ObservableObject {
     /// - Returns: сколько сообщений реально появилось в ленте.
     @discardableResult
     public func mergeServerMessages(_ items: [ChatMessage]) -> Int {
-        var added = 0
-        for item in items {
+        var recognized = Set<Int>()
+        for (index, item) in items.enumerated().reversed() {
             if let sid = item.serverId, messages.contains(where: { $0.serverId == sid }) {
+                recognized.insert(index)
                 continue
             }
             // Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов, а в
@@ -177,19 +190,41 @@ public final class ChatStore: ObservableObject {
             // роняло слияние в дубль ровно на таких ответах.
             let itemKey = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if let localIdx = messages.lastIndex(where: {
-                $0.serverId == nil && $0.role == item.role
+                $0.serverId == nil && !$0.streaming && $0.role == item.role
                     && $0.content.trimmingCharacters(in: .whitespacesAndNewlines) == itemKey
             }) {
                 messages[localIdx].serverId = item.serverId
                 messages[localIdx].failed = false
-                messages[localIdx].streaming = false
-                continue
+                recognized.insert(index)
             }
-            messages.append(item)
+        }
+
+        var added = 0
+        for (index, item) in items.enumerated() where !recognized.contains(index) {
+            // Одна и та же строка дважды в странице.
+            if let sid = item.serverId, messages.contains(where: { $0.serverId == sid }) { continue }
+            messages.insert(item, at: insertionIndex(for: item))
             added += 1
         }
         bumpCursor(items)
         return added
+    }
+
+    /// Место новой серверной строки — сразу после последней строки ленты, которая раньше неё.
+    ///
+    /// Между серверными строками порядок задаёт `serverId` (он растёт на сервере). С
+    /// неподтверждёнными сравнивать можно только время: серверный `createdAt` против часов
+    /// устройства. Расхождение часов на секунды может переставить соседей — ответ менеджера,
+    /// пришедший в те же секунды, что и недоставленное сообщение, — но ничего не теряет и не
+    /// двоит. Главный случай (стартовая история старше отправки на минуты и дни) оно не задевает.
+    private func insertionIndex(for item: ChatMessage) -> Int {
+        let predecessor = messages.lastIndex { existing in
+            if let existingId = existing.serverId, let itemId = item.serverId {
+                return existingId < itemId
+            }
+            return existing.timestamp <= item.timestamp
+        }
+        return predecessor.map { $0 + 1 } ?? 0
     }
 
     /// Курсор только растёт: страница старее текущего значения не имеет права его откатить.

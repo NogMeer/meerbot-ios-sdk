@@ -15,6 +15,10 @@ struct StubResponse {
     /// УСПЕЛ обработать пришедшее до разрыва: мгновенная отдача всего тела одним махом —
     /// нереалистичная модель сети.
     var chunkDelay: TimeInterval = 0
+    /// Ответ не уходит, пока тест не откроет ворота. Нужен там, где проверяется ПОРЯДОК
+    /// событий («история пришла после отправки»): пауза по времени делала бы такой тест
+    /// зависимым от планировщика, ворота — нет.
+    var gate: StubGate?
 
     static func json(_ object: [String: Any], status: Int = 200) -> StubResponse {
         StubResponse(
@@ -38,6 +42,29 @@ struct StubResponse {
     }
 }
 
+/// Ворота для ответа стаба. Открываются один раз и навсегда: ответ, который очередь стаба
+/// повторяет, после открытия отдаётся сразу.
+final class StubGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var isOpen = false
+
+    func open() {
+        condition.lock(); defer { condition.unlock() }
+        isOpen = true
+        condition.broadcast()
+    }
+
+    /// `false` — ворота так и не открыли: тест забыл про них, и зависать ему нельзя.
+    fileprivate func waitUntilOpen(timeout: TimeInterval) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !isOpen {
+            if !condition.wait(until: deadline) { return isOpen }
+        }
+        return true
+    }
+}
+
 struct RecordedRequest {
     let url: URL
     let method: String
@@ -57,6 +84,7 @@ final class StubURLProtocol: URLProtocol {
         lock.lock(); defer { lock.unlock() }
         queues = [:]
         recorded = []
+        completedByPath = [:]
     }
 
     static func enqueue(path: String, _ responses: StubResponse...) {
@@ -108,6 +136,24 @@ final class StubURLProtocol: URLProtocol {
             return
         }
 
+        guard let gate = stub.gate else {
+            deliver(stub, path: path)
+            return
+        }
+        // Ждём ворота НЕ на потоке загрузки: URLSession крутит протоколы на общем потоке, и
+        // заблокированный ответ задержал бы все остальные запросы теста — порядок, который
+        // тест проверяет, стал бы невоспроизводимым.
+        DispatchQueue.global().async { [self] in
+            guard gate.waitUntilOpen(timeout: 5) else {
+                client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+                Self.markCompleted(path)
+                return
+            }
+            deliver(stub, path: path)
+        }
+    }
+
+    private func deliver(_ stub: StubResponse, path: String) {
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: stub.status,
@@ -129,6 +175,21 @@ final class StubURLProtocol: URLProtocol {
         } else {
             client?.urlProtocolDidFinishLoading(self)
         }
+        Self.markCompleted(path)
+    }
+
+    private static var completedByPath: [String: Int] = [:]
+
+    /// Сколько ответов по пути транспорт уже отдал целиком (или оборвал) — после ворот
+    /// это единственный способ узнать, что запоздалый ответ долетел.
+    static func completed(path: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return completedByPath[path] ?? 0
+    }
+
+    private static func markCompleted(_ path: String) {
+        lock.lock(); defer { lock.unlock() }
+        completedByPath[path, default: 0] += 1
     }
 
     override func stopLoading() {}
