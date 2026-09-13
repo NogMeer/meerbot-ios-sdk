@@ -39,6 +39,10 @@ public final class ChatController: ObservableObject {
     private var pollTask: Task<Void, Never>?
     /// Экран чата на виду. Догон крутится ТОЛЬКО когда `screenVisible && isReady`.
     private var screenVisible = false
+    /// Растёт при смене identity. Задачи, начатые до неё, сверяют значение после каждого
+    /// `await`: отмена не останавливает уже отправленный запрос, и без сверки его ответ —
+    /// страница ПРЕЖНЕГО пользователя — лёг бы в только что очищенную ленту.
+    private var identityEpoch = 0
     private var lifecycleSubscriptions = Set<AnyCancellable>()
 
     /// Периоды догона — те же, что у веб-виджета. `var` ради тестов: они ужимают их до
@@ -104,19 +108,25 @@ public final class ChatController: ObservableObject {
             startPolling()
             return
         }
+        let epoch = identityEpoch
         startTask = Task { [weak self] in
             guard let self else { return }
             do {
                 _ = try await self.client.openSession()
+                // Identity сменилась: сброс уже запустил свою попытку, и `startTask` теперь
+                // её — состояние этой, устаревшей, никуда не применяется.
+                guard self.identityEpoch == epoch else { return }
                 self.store.setError(nil)
                 // История тянется ВСЕГДА: тред мобильного канала ключуется на устройстве, и
                 // регистрация про существование диалога ничего не сообщает. Пустая лента —
                 // штатный ответ, а не ошибка. Оттуда же приходит режим: кто отвечает
                 // пользователю (`ai` | `human`), знает только серверная строка диалога.
                 try? await self.loadHistory()
+                guard self.identityEpoch == epoch else { return }
                 self.isReady = true
                 self.startPolling()
             } catch {
+                guard self.identityEpoch == epoch else { return }
                 self.isReady = false
                 self.store.setError(Self.message(for: error))
             }
@@ -153,12 +163,16 @@ public final class ChatController: ObservableObject {
     public func openConversation(id: Int) {
         Task { [weak self] in
             guard let self else { return }
+            let epoch = self.identityEpoch
             await self.client.setConversationId(id)
+            guard self.identityEpoch == epoch else { return }
             self.conversationId = id
             do {
                 try await self.loadHistory()
+                guard self.identityEpoch == epoch else { return }
                 self.store.setError(nil)
             } catch {
+                guard self.identityEpoch == epoch else { return }
                 self.store.setError(Self.message(for: error))
             }
         }
@@ -186,6 +200,29 @@ public final class ChatController: ObservableObject {
         store.setSending(false)
         // `isReady` СОЗНАТЕЛЬНО не сбрасываем: сессия остаётся живой, и следующее открытие
         // экрана обойдётся догоном вместо новой регистрации устройства.
+    }
+
+    /// Сменился пользователь (`MeerBot.identify`): переписка прежнего человека не должна
+    /// остаться на экране. Задачи отменяются, лента чистится (приветствие хоста остаётся),
+    /// сессия считается закрытой. Открытый экран сразу переподключается — уже с новой
+    /// identity; закрытый в сеть не ходит и поднимет сессию при следующем показе.
+    ///
+    /// Вызывать ПОСЛЕ того, как новая identity применена к `APIClient`: иначе перезапуск
+    /// успел бы зарегистрироваться со старой.
+    func resetForIdentityChange() {
+        let wasVisible = screenVisible
+        identityEpoch += 1
+        stopPolling()
+        streamTask?.cancel()
+        streamTask = nil
+        startTask?.cancel()
+        startTask = nil
+        store.resetForIdentityChange()
+        isReady = false
+        retryableText = nil
+        conversationId = nil
+        screenVisible = false
+        if wasVisible { start() }
     }
 
     // MARK: - Догон ленты
@@ -228,6 +265,7 @@ public final class ChatController: ObservableObject {
     /// стримящегося ответа и подралась бы с плейсхолдером.
     private func catchUp(silent: Bool) async {
         guard isReady, !store.sending, !Task.isCancelled else { return }
+        let epoch = identityEpoch
 
         do {
             for _ in 0..<Self.maxCatchUpPages {
@@ -237,6 +275,7 @@ public final class ChatController: ObservableObject {
                 if Task.isCancelled { return }
                 let cursor = store.lastServerMessageId
                 let page = try await client.history(since: cursor > 0 ? cursor : nil, limit: 50)
+                guard identityEpoch == epoch else { return }
                 store.setMode(page.mode)
                 store.mergeServerMessages(Self.map(page.messages))
                 if !page.hasMore { break }
@@ -245,7 +284,7 @@ public final class ChatController: ObservableObject {
             // «Повторить» вместе с сообщением о том, почему она там.
             if retryableText == nil { store.setError(nil) }
         } catch {
-            guard !silent else { return }
+            guard !silent, identityEpoch == epoch else { return }
             store.setError(Self.message(for: error))
         }
     }
@@ -258,13 +297,18 @@ public final class ChatController: ObservableObject {
         store.setSending(true)
         let placeholder = store.appendAssistantPlaceholder()
 
+        let epoch = identityEpoch
         var task: Task<Void, Never>?
         task = Task { [weak self] in
             guard let self else { return }
             do {
                 for try await event in await self.client.sendMessage(text) {
+                    // Смена identity отменяет задачу, но кадр, уже лежащий в буфере потока,
+                    // мог бы дойти — в ленту нового пользователя.
+                    guard self.identityEpoch == epoch else { return }
                     self.handle(event, placeholderId: placeholder.id)
                 }
+                guard self.identityEpoch == epoch else { return }
                 self.store.finalizeAssistant(id: placeholder.id)
                 self.store.dropEmptyPlaceholder(id: placeholder.id)
                 self.store.setSending(false)
@@ -273,6 +317,7 @@ public final class ChatController: ObservableObject {
                 // обе строки как «новые», и слияние держалось бы на совпадении текста.
                 await self.catchUp(silent: true)
             } catch {
+                guard self.identityEpoch == epoch else { return }
                 await self.handleFailure(
                     error,
                     text: text,
@@ -355,6 +400,7 @@ public final class ChatController: ObservableObject {
         if error is CancellationError { return }
 
         store.setError(Self.message(for: error))
+        let epoch = identityEpoch
 
         // Диалог мог быть уже заведён, а ответ — дописан сервером, пока рвалось соединение.
         // Серверную ленту принимаем ТОЛЬКО если она заканчивается ответом: иначе замена
@@ -362,9 +408,11 @@ public final class ChatController: ObservableObject {
         if await client.conversationId != nil,
            let items = try? await fetchHistory(),
            items.last?.role == "assistant" {
+            guard identityEpoch == epoch else { return }
             store.replaceAll(items)
             return
         }
+        guard identityEpoch == epoch else { return }
 
         store.setFailed(id: userMessageId, true)
         retryableText = text
@@ -376,7 +424,9 @@ public final class ChatController: ObservableObject {
     /// а не свойство сообщений, и пропусти мы его, экран предлагал бы писать боту, который
     /// в этом режиме молчит.
     private func loadHistory() async throws {
+        let epoch = identityEpoch
         let page = try await client.history()
+        guard identityEpoch == epoch else { return }
         store.setMode(page.mode)
         let items = Self.map(page.messages)
         guard !items.isEmpty else { return }

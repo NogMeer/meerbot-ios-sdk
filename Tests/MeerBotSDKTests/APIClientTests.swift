@@ -13,10 +13,24 @@ final class APIClientTests: XCTestCase {
     private let streamPath = "/api/v1/mobile/chat/stream"
     private let messagesPath = "/api/v1/mobile/messages"
 
-    override func setUp() {
-        super.setUp()
+    /// Свой домен настроек на тест: флаг выхода живёт на диске, и `.standard` пронёс бы его
+    /// из одного теста (и прогона) в другой.
+    private var suiteName = ""
+    private var defaults = UserDefaults.standard
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         StubURLProtocol.reset()
+        suiteName = "MeerBotSDKTests.APIClient.\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: suiteName)
+        super.tearDown()
+    }
+
+    private var flagStore: IdentityFlagStore { IdentityFlagStore(defaults: defaults) }
 
     private func makeClient() -> APIClient {
         APIClient(
@@ -27,25 +41,34 @@ final class APIClientTests: XCTestCase {
             ),
             visitorUuid: visitorUuid,
             installationId: installationId,
-            sessionConfiguration: .stubbed()
+            sessionConfiguration: .stubbed(),
+            flagStore: flagStore
         )
     }
 
+    /// `unlinked: nil` — ответ старого сервера, который поля не знает.
     private func stubRegister(
         jwt: String = "jwt-1",
         expiresIn: Int = 900,
-        identityStatus: String = "not_provided"
+        identityStatus: String = "not_provided",
+        unlinked: Bool? = nil,
+        delay: TimeInterval = 0
     ) {
-        StubURLProtocol.enqueue(
-            path: registerPath,
-            .json([
-                "deviceId": "42",
-                "jwt": jwt,
-                "expiresIn": expiresIn,
-                "attestationRequired": false,
-                "identity": ["status": identityStatus],
-            ])
-        )
+        var identity: [String: Any] = ["status": identityStatus]
+        if let unlinked { identity["unlinked"] = unlinked }
+        var response = StubResponse.json([
+            "deviceId": "42",
+            "jwt": jwt,
+            "expiresIn": expiresIn,
+            "attestationRequired": false,
+            "identity": identity,
+        ])
+        response.chunkDelay = delay
+        StubURLProtocol.enqueue(path: registerPath, response)
+    }
+
+    private func registerBodies() -> [[String: Any]] {
+        StubURLProtocol.requests(path: registerPath).compactMap(\.body)
     }
 
     private func collect(
@@ -170,6 +193,109 @@ final class APIClientTests: XCTestCase {
         XCTAssertNil(request.body?["identityToken"])
     }
 
+    // MARK: Выход
+
+    /// Выход — отдельное поле, а не `identityToken: null`: у сервера токен — строка, и `null`
+    /// вернул бы 400.
+    func testВыходУходитВСледующуюРегистрациюБезIdentityТокена() async throws {
+        stubRegister(unlinked: true)
+        let client = makeClient()
+        await client.setIdentityToken("token.of.a")
+
+        await client.logout()
+        _ = try await client.openSession()
+
+        let body = try XCTUnwrap(registerBodies().first)
+        XCTAssertEqual(body["logout"] as? Bool, true)
+        XCTAssertNil(body["identityToken"], "токен вышедшего пользователя не уходит")
+    }
+
+    func testБезВыходаПоляLogoutВЗапросеНет() async throws {
+        stubRegister(unlinked: false)
+        _ = try await makeClient().openSession()
+
+        let body = try XCTUnwrap(registerBodies().first)
+        XCTAssertNil(body["logout"])
+    }
+
+    func testПодтверждённыйСерверомВыходСнимаетФлаг() async throws {
+        stubRegister(jwt: "jwt-1", unlinked: true)
+        stubRegister(jwt: "jwt-2", unlinked: false)
+        let client = makeClient()
+
+        await client.logout()
+        _ = try await client.openSession()
+        _ = try await client.openSession()
+
+        XCTAssertEqual(registerBodies().map { $0["logout"] as? Bool }, [true, nil])
+        XCTAssertFalse(flagStore.logoutPending)
+    }
+
+    /// Старый сервер поле `logout` игнорирует и `unlinked` не присылает. Снять флаг по
+    /// такому ответу — значит потерять выход навсегда: после обновления сервера его уже
+    /// некому будет прислать.
+    func testСтарыйСерверНеСнимаетФлагИВыходШлётсяСнова() async throws {
+        stubRegister(jwt: "jwt-1")
+        stubRegister(jwt: "jwt-2")
+        let client = makeClient()
+
+        await client.logout()
+        _ = try await client.openSession()
+        _ = try await client.openSession()
+
+        XCTAssertEqual(registerBodies().map { $0["logout"] as? Bool }, [true, true])
+        XCTAssertTrue(flagStore.logoutPending)
+    }
+
+    /// Регистрация ленивая: выход до `configure()` или перед убийством приложения доходит
+    /// только флагом на диске.
+    func testФлагВыходаИзПрошлогоЗапускаУходитВПервуюРегистрацию() async throws {
+        defaults.set(true, forKey: IdentityFlagStore.pendingLogoutKey)
+        stubRegister(unlinked: true)
+
+        _ = try await makeClient().openSession()
+
+        XCTAssertEqual(registerBodies().first?["logout"] as? Bool, true)
+        XCTAssertFalse(flagStore.logoutPending)
+    }
+
+    func testВыходИНовыйТокенУходятВОднойРегистрации() async throws {
+        stubRegister(identityStatus: "verified", unlinked: true)
+        let client = makeClient()
+
+        await client.logout()
+        await client.setIdentityToken("token.of.b")
+        _ = try await client.openSession()
+
+        let body = try XCTUnwrap(registerBodies().first)
+        XCTAssertEqual(body["logout"] as? Bool, true)
+        XCTAssertEqual(body["identityToken"] as? String, "token.of.b")
+    }
+
+    /// Регистрация ушла ДО выхода и вернула JWT устройства, ещё связанного с вышедшим
+    /// пользователем. Сохрани клиент его — чат ходил бы под чужой связью до истечения токена.
+    func testРегистрацияНачатаяДоВыходаНеОставляетСтарыйJWT() async throws {
+        stubRegister(jwt: "jwt-linked", delay: 0.3)
+        stubRegister(jwt: "jwt-after-logout", unlinked: true)
+        let client = makeClient()
+
+        async let token = client.validToken()
+        let deadline = Date().addingTimeInterval(5)
+        while StubURLProtocol.requests(path: registerPath).isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 1, "первая регистрация в полёте")
+
+        await client.logout()
+        let value = try await token
+
+        XCTAssertEqual(value, "jwt-after-logout")
+        XCTAssertEqual(registerBodies().map { $0["logout"] as? Bool }, [nil, true])
+        let reused = try await client.validToken()
+        XCTAssertEqual(reused, "jwt-after-logout", "сохранён токен новой регистрации, не прежней")
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 2)
+    }
+
     // MARK: Токен
 
     func testДействующийТокенПереиспользуетсяБезПовторнойРегистрации() async throws {
@@ -242,6 +368,47 @@ final class APIClientTests: XCTestCase {
 
         XCTAssertEqual((error as? MeerBotError)?.code, "jwt_expired")
         XCTAssertEqual(StubURLProtocol.requests(path: streamPath).count, 2)
+    }
+
+    /// Строку устройства увёл в отставку выход (например, на другой копии клиента) — токен
+    /// указывает на устройство, которого нет. Лечится новой регистрацией, как `jwt_*`.
+    func testСнятоеУстройствоВИсторииПеререгистрируетсяИЗапросПовторяется() async throws {
+        stubRegister(jwt: "jwt-old")
+        stubRegister(jwt: "jwt-new")
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "error": ["type": "authentication_error", "code": "device_not_found", "message": "gone"],
+            ], status: 401),
+            .json(["messages": [], "hasMore": false, "mode": "ai"])
+        )
+
+        let page = try await makeClient().history()
+
+        XCTAssertTrue(page.messages.isEmpty)
+        let requests = StubURLProtocol.requests(path: messagesPath)
+        XCTAssertEqual(requests.count, 2, "ровно одна повторная попытка")
+        XCTAssertEqual(requests.last?.headers["Authorization"], "Bearer jwt-new")
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 2)
+    }
+
+    func testСнятоеУстройствоВПотокеПеререгистрируетсяИЗапросПовторяется() async throws {
+        stubRegister(jwt: "jwt-old")
+        stubRegister(jwt: "jwt-new")
+        StubURLProtocol.enqueue(
+            path: streamPath,
+            .json([
+                "error": ["type": "authentication_error", "code": "device_claim_missing", "message": "old"],
+            ], status: 401),
+            .sse("data: [DONE]\n\n")
+        )
+
+        let (events, error) = await collect(makeClient().sendMessage("привет"))
+
+        XCTAssertNil(error)
+        XCTAssertEqual(events, [.done])
+        let requests = StubURLProtocol.requests(path: streamPath)
+        XCTAssertEqual(requests.map { $0.headers["Authorization"] }, ["Bearer jwt-old", "Bearer jwt-new"])
     }
 
     /// `channel_mismatch` — токен НЕ протух, он от другого канала (403). Перевыпуск его не

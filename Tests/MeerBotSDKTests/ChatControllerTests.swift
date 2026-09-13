@@ -341,4 +341,101 @@ final class ChatControllerTests: XCTestCase {
         try await waitUntil("применения диалога") { controller.conversationId == 42 }
     }
 
+    // MARK: - Смена identity
+
+    // До 0.2.9 выход не трогал ленту: `loadHistory` пропускает пустую страницу, и следующий
+    // человек на телефоне видел переписку прежнего до перезапуска приложения.
+
+    private let previousUserThread: [[String: Any]] = [
+        ["id": 1, "role": "user", "content": "мой номер договора 123", "createdAt": "2026-09-01T10:00:00.000Z"],
+        ["id": 2, "role": "assistant", "content": "Нашёл договор", "createdAt": "2026-09-01T10:00:01.000Z"],
+    ]
+
+    private func makeSuiteDefaults() throws -> UserDefaults {
+        let suiteName = "MeerBotSDKTests.ChatController.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        return defaults
+    }
+
+    func testСменаIdentityОчищаетЛентуИОткрытыйЭкранПереподключаетсяСВыходом() async throws {
+        stubRegister()
+        stubHistory(previousUserThread) // старт
+        // Пуш прежнему пользователю: ответ долетает уже ПОСЛЕ сброса — ровно тот случай,
+        // когда отмена не помогает, а переписка прежнего человека легла бы в новую ленту.
+        var latePushPage = StubResponse.json(["messages": previousUserThread, "hasMore": false, "mode": "ai"])
+        latePushPage.chunkDelay = 0.3
+        StubURLProtocol.enqueue(path: messagesPath, latePushPage)
+        stubHistory() // новый тред после выхода
+
+        let client = APIClient(
+            config: MeerBotConfiguration(apiKey: "pk_live_test", baseURL: URL(string: "https://meerbot.test")!),
+            visitorUuid: "11111111-2222-4333-8444-555555555555",
+            installationId: "99999999-8888-4777-8666-555555555555",
+            sessionConfiguration: .stubbed(),
+            flagStore: IdentityFlagStore(defaults: try makeSuiteDefaults())
+        )
+        let controller = ChatController(client: client)
+        controller.store.setGreeting("Здравствуйте! Мы на связи.")
+        controller.start()
+        try await waitUntil("ленты прежнего пользователя") {
+            controller.isReady && controller.store.messages.count == 2
+        }
+        controller.openConversation(id: 55)
+        try await waitUntil("запроса истории по пушу") {
+            controller.conversationId == 55 && StubURLProtocol.requests(path: self.messagesPath).count == 2
+        }
+
+        await client.logout()
+        controller.resetForIdentityChange()
+
+        XCTAssertTrue(controller.store.messages.isEmpty, "лента прежнего пользователя стёрта сразу")
+        XCTAssertFalse(controller.isReady)
+        XCTAssertNil(controller.conversationId)
+        XCTAssertEqual(controller.store.greeting, "Здравствуйте! Мы на связи.", "приветствие задаёт хост")
+
+        try await waitUntil("переподключения") { controller.isReady }
+        // Ждём, пока запоздалый ответ по пушу гарантированно долетит.
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertTrue(controller.store.messages.isEmpty, "пустой новый тред не возвращает старую ленту")
+        let registers = StubURLProtocol.requests(path: registerPath)
+        XCTAssertEqual(registers.count, 2, "открытый экран перерегистрировался")
+        XCTAssertEqual(registers.last?.body?["logout"] as? Bool, true)
+    }
+
+    func testСменаIdentityНаЗакрытомЭкранеНеХодитВСеть() async throws {
+        stubRegister()
+        stubHistory(previousUserThread)
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("ленты прежнего пользователя") {
+            controller.isReady && controller.store.messages.count == 2
+        }
+        controller.stop()
+        let requestsBefore = StubURLProtocol.requests.count
+
+        controller.resetForIdentityChange()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertTrue(controller.store.messages.isEmpty)
+        XCTAssertFalse(controller.isReady)
+        XCTAssertEqual(StubURLProtocol.requests.count, requestsBefore, "сессия поднимется при следующем показе")
+    }
+
+    /// По `sub` решается, сменился ли человек: токены живут минуты, и сравнение строк чистило
+    /// бы ленту на каждом свежем токене того же пользователя.
+    func testСубъектIdentityТокенаЧитаетсяИзPayload() {
+        func jwt(_ payload: String) -> String {
+            let encoded = Data(payload.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            return "eyJhbGciOiJIUzI1NiJ9.\(encoded).signature"
+        }
+
+        XCTAssertEqual(MeerBot.identitySubject(of: jwt(#"{"sub":"user-42","iat":1}"#)), "user-42")
+        XCTAssertNil(MeerBot.identitySubject(of: jwt(#"{"iat":1}"#)), "без sub — сравнение по токену")
+        XCTAssertNil(MeerBot.identitySubject(of: "not-a-jwt"))
+    }
 }

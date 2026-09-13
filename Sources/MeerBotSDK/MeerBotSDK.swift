@@ -13,7 +13,7 @@ import Foundation
 import SwiftUI
 
 public enum MeerBotPlatform {
-    public static let version = "0.2.8"
+    public static let version = "0.2.9"
     public static let apiBaseUrl = "https://meerbot.ru"
 }
 
@@ -28,7 +28,13 @@ public final class MeerBot {
     private var configuration: MeerBotConfiguration?
     private var visitorUuid: String?
     /// identity-токен, переданный до configure() — применим, как только появится клиент.
+    /// Выход (`nil`) сюда не кладётся: он пишется флагом на диск и доходит сам.
     private var pendingIdentityToken: String?
+    /// Кто сейчас применён: `sub` токена (или сам токен, если `sub` не прочитать); `nil` —
+    /// аноним. По нему решается, сменился ли ЧЕЛОВЕК и надо ли чистить ленту.
+    private var appliedIdentityKey: String?
+    /// Последнее применение identity. Следующее ждёт его: см. `identify(token:)`.
+    private var identityTask: Task<Void, Never>?
 
     /// APNs-токен устройства, если хост его получил.
     ///
@@ -97,18 +103,45 @@ public final class MeerBot {
     ///
     /// Токен применяется НЕМЕДЛЕННО: текущая сессия сбрасывается, и следующий запрос
     /// перерегистрирует устройство уже с идентичностью. Результат проверки — в
-    /// `identityStatus`; провал SOFT: чат продолжает работать анонимно.
+    /// `identityStatus`; провал SOFT: чат продолжает работать анонимно. Если токен принадлежит
+    /// ДРУГОМУ пользователю (другой `sub`), лента на экране очищается; свежий токен того же
+    /// пользователя ленту не трогает.
     ///
-    /// `identify(token: nil)` — выход пользователя: связь на сервере НЕ стирается (она
-    /// принадлежит прежнему владельцу устройства), но новая сессия будет анонимной.
+    /// `identify(token: nil)` — настоящий выход: с 0.2.9 SDK при следующем подключении
+    /// отвязывает устройство на сервере (прежний тред остаётся за прежним пользователем,
+    /// новый начинается пустым) и сразу очищает ленту на экране. Сигнал сохраняется на диск
+    /// и переживает перезапуск приложения, вызов до `configure(...)` тоже работает.
+    /// Вызывайте `nil` ТОЛЬКО на реальный выход, а не когда токен просто не успели получить:
+    /// каждый такой вызов разрывает связь пользователя с его перепиской.
     public func identify(token: String?) {
-        guard let client else {
+        // Флаг — ПЕРВЫМ и на диск: регистрация ленивая, и выход до configure() или выход,
+        // после которого приложение убили до первого показа чата, иначе потерялся бы.
+        if token == nil { IdentityFlagStore().logoutPending = true }
+
+        guard let client, let controller else {
             pendingIdentityToken = token
             return
         }
-        Task {
-            await client.setIdentityToken(token)
-            await client.invalidateToken()
+
+        // Ленту чистим, только когда сменился ЧЕЛОВЕК. Токены живут минуты, и хост выпускает
+        // свежий на каждый вход в чат: сравнение строк сбрасывало бы ленту (и обрывало
+        // стримящийся ответ) на каждом таком вызове. Выход чистит всегда: связь могла
+        // остаться с прошлого запуска, когда `identify` в этом процессе ещё не звали.
+        let identityKey = token.map { Self.identitySubject(of: $0) ?? $0 }
+        let personChanged = token == nil || identityKey != appliedIdentityKey
+        appliedIdentityKey = identityKey
+
+        // Вызовы применяются строго по очереди: `identify(nil)` и следом `identify(token: B)`,
+        // исполненные в обратном порядке, оставили бы пользователя B анонимным.
+        let previous = identityTask
+        identityTask = Task {
+            await previous?.value
+            if let token {
+                await client.setIdentityToken(token)
+            } else {
+                await client.logout()
+            }
+            if personChanged { controller.resetForIdentityChange() }
         }
     }
 
@@ -189,7 +222,7 @@ public final class MeerBot {
     }
 
     /// Сбросить состояние SDK (GDPR Art. 17 на стороне клиента): идентификатор установки,
-    /// визитор, история, токены.
+    /// визитор, история, токены, неотправленный сигнал выхода.
     ///
     /// ⚠️ Новый идентификатор установки означает НОВЫЙ тред: прежняя переписка остаётся на
     /// сервере за прежним устройством и в приложении больше не появится. Серверного
@@ -198,14 +231,19 @@ public final class MeerBot {
     public func reset() {
         controller?.stop()
         controller?.store.resetForLogout()
+        identityTask?.cancel()
+        identityTask = nil
         client = nil
         controller = nil
         configuration = nil
         visitorUuid = nil
         pendingIdentityToken = nil
+        appliedIdentityKey = nil
         pushToken = nil
         UserDefaults.standard.removeObject(forKey: Self.visitorUuidKey)
         UserDefaults.standard.removeObject(forKey: Self.installationIdKey)
+        // Выход относился к прежней установке; новая с сервером ещё не связана.
+        IdentityFlagStore().logoutPending = false
     }
 
     // MARK: - Внутреннее
@@ -223,6 +261,25 @@ public final class MeerBot {
     /// склеенные они однажды разъедутся молча.
     private static func getOrCreateInstallationId() -> String {
         getOrCreateUuid(forKey: installationIdKey)
+    }
+
+    /// `sub` identity-токена — только чтобы понять, сменился ли человек. Подпись здесь не
+    /// проверяется и не должна: связь устанавливает сервер, а по этому значению решается
+    /// лишь, чистить ли ленту. `nil` — токен не JWT или `sub` в нём нет.
+    nonisolated static func identitySubject(of token: String) -> String? {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        var base64 = parts[1]
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        guard
+            let data = Data(base64Encoded: base64),
+            let claims = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let subject = claims["sub"] as? String,
+            !subject.isEmpty
+        else { return nil }
+        return subject
     }
 
     private static func getOrCreateUuid(forKey key: String) -> String {

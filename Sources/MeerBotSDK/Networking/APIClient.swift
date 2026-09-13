@@ -115,8 +115,10 @@ public enum MeerBotError: Error, LocalizedError {
             case "message_too_long":
                 return "Сообщение слишком длинное."
             case "channel_mismatch", "device_claim_missing", "device_not_found":
-                // Токен от другого канала/устройства либо устройство снято с регистрации.
-                // Обновление токена не помогает — нужна новая регистрация.
+                // Токен от другого канала/устройства либо устройство снято с регистрации
+                // (например, выходом пользователя). `device_*` клиент переживает сам —
+                // перерегистрацией и одним повтором; до экрана они доходят, только если
+                // не помог и повтор.
                 return "Сессия недействительна. Переподключаемся…"
             case _ where status == 401:
                 return "Сессия истекла. Переподключаемся…"
@@ -204,6 +206,39 @@ public struct HistoryPage: Equatable {
     public let mode: ChatMode
 }
 
+// MARK: - Отложенный выход
+
+/// Флаг «пользователь вышел, сервер об этом ещё не знает».
+///
+/// Живёт в `UserDefaults`, а не в памяти: регистрация ленивая (первый показ экрана), и
+/// между `identify(token: nil)` и ней приложение успевают убить. Потеряй мы сигнал —
+/// устройство осталось бы связанным с прежним человеком, и следующий, кто откроет чат на
+/// этом телефоне, увидел бы его переписку.
+///
+/// Снимается ТОЛЬКО подтверждением сервера (`identity.unlinked` в ответе регистрации).
+/// Сервер старше 0.2.9 поле `logout` молча игнорирует и `unlinked` не присылает — тогда
+/// флаг шлётся снова при каждой регистрации, пока сервер не обновится.
+struct IdentityFlagStore {
+    static let pendingLogoutKey = "meerbot.pendingLogout"
+
+    let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    var logoutPending: Bool {
+        get { defaults.bool(forKey: Self.pendingLogoutKey) }
+        nonmutating set {
+            if newValue {
+                defaults.set(true, forKey: Self.pendingLogoutKey)
+            } else {
+                defaults.removeObject(forKey: Self.pendingLogoutKey)
+            }
+        }
+    }
+}
+
 // MARK: - Клиент
 
 /// Потокобезопасный клиент платформы: хранит JWT, обновляет его по истечении и стримит ответы.
@@ -214,12 +249,22 @@ public actor APIClient {
     private let installationId: String
     private let visitorUuid: String
     private let session: URLSession
+    private let flagStore: IdentityFlagStore
 
     private var jwt: String?
     private var jwtExpiresAt: Date?
     /// Единственная выполняющаяся операция регистрации — чтобы параллельные отправки
     /// не выписывали по своему JWT (сервер держит jti-allowlist, лишние токены — мусор).
     private var refreshTask: Task<String, Error>?
+
+    /// Поколение identity: растёт при каждой смене токена и при выходе.
+    ///
+    /// Регистрация, отправленная ДО смены, возвращает JWT прежнего устройства — например,
+    /// ещё связанного с вышедшим пользователем. Сохрани мы его, чат ходил бы под чужой
+    /// связью до истечения токена. Ответ с устаревшим поколением отбрасывается целиком.
+    private var generation = 0
+    /// Сколько раз регистрация повторяется, если identity менялась, пока запрос летел.
+    private static let maxRegisterAttempts = 2
 
     /// Подписанный бэкендом интегратора identity-токен. Уходит в СЛЕДУЮЩУЮ регистрацию:
     /// связь устанавливается только там, чат читает уже подтверждённый claim.
@@ -239,10 +284,29 @@ public actor APIClient {
         installationId: String,
         sessionConfiguration: URLSessionConfiguration = APIClient.defaultSessionConfiguration()
     ) {
+        self.init(
+            config: config,
+            visitorUuid: visitorUuid,
+            installationId: installationId,
+            sessionConfiguration: sessionConfiguration,
+            flagStore: IdentityFlagStore()
+        )
+    }
+
+    /// `flagStore` — отдельно ради тестов: им нужен свой `UserDefaults(suiteName:)`, а не
+    /// общий `.standard`, который переживает прогон.
+    init(
+        config: MeerBotConfiguration,
+        visitorUuid: String,
+        installationId: String,
+        sessionConfiguration: URLSessionConfiguration,
+        flagStore: IdentityFlagStore
+    ) {
         self.config = config
         self.visitorUuid = visitorUuid
         self.installationId = installationId
         self.session = URLSession(configuration: sessionConfiguration)
+        self.flagStore = flagStore
     }
 
     public static func defaultSessionConfiguration() -> URLSessionConfiguration {
@@ -258,20 +322,55 @@ public actor APIClient {
 
     public func setConversationId(_ id: Int?) { conversationId = id }
 
-    /// Задать identity-токен. Применяется при следующей регистрации: чтобы связь установилась
-    /// немедленно, вызывающий сбрасывает текущий токен (`MeerBot.identify` так и делает).
+    /// Задать identity-токен. Действующий JWT сбрасывается сразу: связь устанавливается
+    /// только регистрацией, и следующий запрос её выполнит.
+    ///
+    /// `nil` здесь — «токена нет», а НЕ выход: связь на сервере остаётся. Выход — `logout()`.
     public func setIdentityToken(_ token: String?) {
         identityToken = token
+        generation += 1
+        invalidateToken()
+    }
+
+    /// Пользователь вышел: следующая регистрация отвяжет устройство на сервере.
+    ///
+    /// Флаг пишется на диск (см. `IdentityFlagStore`) и шлётся, пока сервер не подтвердит.
+    /// Прежний тред остаётся за прежним пользователем, новая сессия начинается с пустой ленты.
+    public func logout() {
+        identityToken = nil
+        flagStore.logoutPending = true
+        generation += 1
+        invalidateToken()
+        conversationId = nil
+        lastMessageId = nil
+        identityStatus = .notProvided
     }
 
     // MARK: Регистрация устройства (она же — открытие сессии)
 
     /// Зарегистрировать устройство и получить JWT. Идемпотентно: повторный вызов обновляет
     /// строку устройства (`upsert` по паре «приложение + идентификатор установки») и выдаёт
-    /// новый токен — тред при этом ТОТ ЖЕ.
+    /// новый токен — тред при этом ТОТ ЖЕ. Исключение — отложенный выход: регистрация с
+    /// `logout: true` уводит связанную строку в отставку, и тред начинается новый.
+    ///
+    /// Если identity сменилась, пока запрос летел, ответ отбрасывается и регистрация
+    /// повторяется; не успела и вторая — `MeerBotError.cancelled`.
     @discardableResult
     public func openSession() async throws -> MobileSession {
         guard !config.apiKey.isEmpty else { throw MeerBotError.notConfigured }
+
+        for _ in 0 ..< Self.maxRegisterAttempts {
+            if let session = try await register() { return session }
+        }
+        throw MeerBotError.cancelled
+    }
+
+    /// Одна попытка регистрации. `nil` — ответ относится к прежней identity и отброшен.
+    private func register() async throws -> MobileSession? {
+        // Поколение и флаг фиксируются на момент сборки тела: именно они описывают, ЧТО
+        // сервер получил, а к ответу состояние актора может уже быть другим.
+        let startedGeneration = generation
+        let logoutSent = flagStore.logoutPending
 
         var request = makeRequest(path: "/api/v1/mobile/register", method: "POST")
         var body: [String: Any] = [
@@ -283,9 +382,13 @@ public actor APIClient {
             "sdkVersion": config.sdkVersion,
         ]
         if let identityToken { body["identityToken"] = identityToken }
+        // Отдельное поле, а не `identityToken: null`: у сервера поле токена — строка, и
+        // `null` вернул бы 400. Старый сервер незнакомое поле игнорирует.
+        if logoutSent { body["logout"] = true }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data = try await perform(request)
+        guard generation == startedGeneration else { return nil }
         guard
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
             let token = json["jwt"] as? String,
@@ -300,9 +403,16 @@ public actor APIClient {
         jwt = token
         jwtExpiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
 
-        let status = ((json["identity"] as? [String: Any])?["status"] as? String)
+        let identity = json["identity"] as? [String: Any]
+        let status = (identity?["status"] as? String)
             .flatMap(IdentityStatus.init(rawValue:)) ?? .notProvided
         identityStatus = status
+
+        // Сервер 0.2.9+ присылает `unlinked` всегда — само его наличие значит «выход принят»
+        // (значение `false` — отвязывать было нечего). Нет поля — сервер старый: флаг остаётся.
+        if logoutSent, identity?["unlinked"] is Bool {
+            flagStore.logoutPending = false
+        }
 
         return MobileSession(
             jwt: token,
@@ -329,7 +439,7 @@ public actor APIClient {
         return try await task.value
     }
 
-    /// Пометить текущий токен недействительным (сервер ответил 401 jwt_*).
+    /// Пометить текущий токен недействительным (сервер ответил 401 `jwt_*`/`device_*`).
     public func invalidateToken() {
         jwt = nil
         jwtExpiresAt = nil
@@ -400,7 +510,8 @@ public actor APIClient {
     ///
     /// Поведение при обрыве: итерация выбрасывает `MeerBotError.network` — уже полученные
     /// события остаются доставленными, вызывающая сторона решает, догонять ли историю.
-    /// Истёкший JWT (401 `jwt_*`) обновляется прозрачно, запрос повторяется РОВНО один раз.
+    /// Истёкший JWT (401 `jwt_*`) или снятое с регистрации устройство (401 `device_*`)
+    /// обновляются прозрачно, запрос повторяется РОВНО один раз.
     public func sendMessage(_ text: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -441,10 +552,10 @@ public actor APIClient {
             var payload = Data()
             for try await byte in bytes { payload.append(byte) }
             let error = Self.decodeError(status: http.statusCode, data: payload)
-            // Единственный автоматический повтор — на протухший токен. `channel_mismatch`
-            // сюда НЕ попадает (403 и другой код): токен не протух, он от другого канала,
-            // и перевыпуск его не исправит.
-            if http.statusCode == 401, error.code.hasPrefix("jwt_"), allowRetry {
+            // Единственный автоматический повтор — на токен, который лечится перерегистрацией.
+            // `channel_mismatch` сюда НЕ попадает (403 и другой код): токен не протух, он от
+            // другого канала, и перевыпуск его не исправит.
+            if Self.isRecoverableBySession(status: http.statusCode, code: error.code), allowRetry {
                 invalidateToken()
                 try await runStream(text: text, allowRetry: false, continuation: continuation)
                 return
@@ -525,7 +636,8 @@ public actor APIClient {
         return data
     }
 
-    /// Запрос с Authorization: 401 по протухшему JWT обновляет сессию и повторяется один раз.
+    /// Запрос с Authorization: 401 по протухшему JWT или снятому устройству обновляет сессию
+    /// и повторяется один раз.
     private func performAuthorized(_ request: URLRequest, allowRetry: Bool = true) async throws -> Data {
         do {
             return try await perform(request)
@@ -533,8 +645,7 @@ public actor APIClient {
             guard
                 allowRetry,
                 case let .http(status, code, _) = error,
-                status == 401,
-                code.hasPrefix("jwt_")
+                Self.isRecoverableBySession(status: status, code: code)
             else { throw error }
 
             invalidateToken()
@@ -542,6 +653,15 @@ public actor APIClient {
             retry.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")
             return try await performAuthorized(retry, allowRetry: false)
         }
+    }
+
+    /// 401, который лечит новая регистрация: протухший JWT (`jwt_*`) или токен устройства,
+    /// которого больше нет (`device_not_found` — строку увёл в отставку выход или смена
+    /// пользователя; `device_claim_missing` — токен старого формата). До 0.2.9 на `device_*`
+    /// экран обещал «Переподключаемся…», а переподключения не было.
+    static func isRecoverableBySession(status: Int, code: String) -> Bool {
+        guard status == 401 else { return false }
+        return code.hasPrefix("jwt_") || code == "device_not_found" || code == "device_claim_missing"
     }
 
     /// Ошибки платформы приходят в форме Stripe/OpenAI: `{error:{type,code,message}}`.

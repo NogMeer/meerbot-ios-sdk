@@ -205,13 +205,20 @@ public final class ChatStore: ObservableObject {
     }
 
     public func resetForLogout() {
+        resetForIdentityChange()
+        greeting = nil
+    }
+
+    /// Сменился пользователь (выход или другой вход): лента, режим, черновик и курсор
+    /// прежнего человека не должны пережить смену. Приветствие остаётся — его задаёт хост,
+    /// и к пользователю оно не относится.
+    func resetForIdentityChange() {
         messages.removeAll()
         mode = .ai
         operatorTyping = nil
         draft = ""
         sending = false
         connectionError = nil
-        greeting = nil
         lastServerMessageId = 0
     }
 }
