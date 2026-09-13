@@ -2,8 +2,13 @@
 //
 // Соответствие событий бэкенду — `src/app/api/v1/mobile/chat/stream/route.ts`. Форма кадров
 // намеренно совпадает с виджетной (`/api/v1/widget/chat/stream`), поэтому парсер один:
-//   event: meta                 → {conversationId, mode}
-//   (без event)                 → OpenAI-совместимый чанк {choices:[{delta:{content}}]}
+//   event: meta                 → {conversationId, mode}; если запрос нёс `clientMessageId`, ещё
+//                                 {clientMessageId, userMessageId, replayed} — сервер записал
+//                                 сообщение (или узнал повтор) ДО ответа. Публичный `.meta`
+//                                 этих полей не несёт: их читает `acceptance(from:)`
+//   (без event)                 → OpenAI-совместимый чанк {choices:[{delta:{content}}]}; чанк
+//                                 с пустой `delta` и `finish_reason` (так кончается повтор
+//                                 ответа) полезной нагрузки не несёт и пропускается
 //   data: [DONE]                → генерация AI завершена
 //   event: manager_message      → {messageId, role, text, authorName, createdAt}
 //   event: escalation           → {triggered, reason} — позвали человека (модель, просьба
@@ -42,6 +47,23 @@ public enum ChatStreamEvent: Equatable {
     case shutdown(reason: String)
     /// Событие, которого этот SDK ещё не знает. Не ошибка — сервер расширяем без ломки клиентов.
     case unknown(name: String)
+}
+
+/// Сервер принял сообщение, отправленное с `clientMessageId` (см. `ChatStreamEvent.acceptance`).
+///
+/// Внутреннее: публичный `ChatStreamEvent` не меняется, чтобы не ломать `switch` у хостов,
+/// которые разбирают поток сами.
+struct StreamAcceptance: Equatable, Sendable {
+    let clientMessageId: String
+    let userMessageId: Int
+    let replayed: Bool
+}
+
+/// Событие внутреннего потока (`APIClient.sendMessage(_:clientMessageId:)`): публичные события
+/// плюс подтверждение приёма, которое идёт СРАЗУ за своим `meta`.
+enum StreamEvent: Equatable {
+    case event(ChatStreamEvent)
+    case accepted(StreamAcceptance)
 }
 
 extension ChatStreamEvent {
@@ -111,6 +133,24 @@ extension ChatStreamEvent {
         default:
             return .unknown(name: sse.name)
         }
+    }
+
+    /// Подтверждение из `meta`: сервер записал сообщение с этим `clientMessageId` под
+    /// `userMessageId` (`replayed` — это повтор уже записанного). `nil` — кадр не `meta` или
+    /// сервер полей не прислал (старый сервер, запрос без id).
+    static func acceptance(from sse: SSEEvent) -> StreamAcceptance? {
+        guard
+            sse.name == "meta",
+            let json = Self.decodeObject(sse.data),
+            let clientMessageId = json["clientMessageId"] as? String,
+            !clientMessageId.isEmpty,
+            let userMessageId = json["userMessageId"] as? Int
+        else { return nil }
+        return StreamAcceptance(
+            clientMessageId: clientMessageId,
+            userMessageId: userMessageId,
+            replayed: (json["replayed"] as? Bool) ?? false
+        )
     }
 
     private static func decodeObject(_ raw: String) -> [String: Any]? {

@@ -58,7 +58,7 @@ public struct ChatView: View {
                 )
                 Divider()
             }
-            MessagesList(store: store)
+            MessagesList(store: store, onRetry: { controller.retry(messageId: $0) })
                 // ТАП по переписке убирает клавиатуру. Протягивания
                 // (`scrollDismissesKeyboard`) недостаточно: оно требует, чтобы списку было
                 // куда прокручиваться, а в свежем диалоге сообщений одно-два — тянуть
@@ -147,6 +147,8 @@ private struct ConnectionBanner: View {
 
 struct MessagesList: View {
     @ObservedObject var store: ChatStore
+    /// Тап по недоставленному пузырю — повтор именно этой строки.
+    let onRetry: (String) -> Void
 
     /// Первая порция истории уже показана? До неё прыжок вниз делается БЕЗ анимации.
     ///
@@ -182,7 +184,7 @@ struct MessagesList: View {
             // `.equatable()` — из-за черновика. Поле ввода привязано к `ChatStore.draft`, и
             // каждая буква публикует изменение всего стора: этот вью перестраивается. Сама
             // лента при этом не пересобирается — массив тот же, и сравнение отвечает сразу.
-            MessagesFeed(messages: store.messages, greeting: store.greeting)
+            MessagesFeed(messages: store.messages, greeting: store.greeting, onRetry: onRetry)
                 .equatable()
         }
         // Открытие экрана. Одного `onChange` мало: `ChatStore` живёт в синглтоне
@@ -252,6 +254,17 @@ struct MessagesList: View {
 struct MessagesFeed: View, Equatable {
     let messages: [ChatMessage]
     let greeting: String?
+    let onRetry: (String) -> Void
+
+    /// Сравнение — по данным ленты; замыкание повтора в него не входит (оно пересоздаётся на
+    /// каждом кадре и сравнимым не бывает, а зовёт одно и то же).
+    ///
+    /// `nonisolated`: `Equatable` объявлен вне актора, и SwiftUI сравнивает вью там, где ему
+    /// удобно. Без этого strict-concurrency видит обращение к `@MainActor`-состоянию из
+    /// неизолированного контекста.
+    nonisolated static func == (lhs: MessagesFeed, rhs: MessagesFeed) -> Bool {
+        lhs.messages == rhs.messages && lhs.greeting == rhs.greeting
+    }
 
     var body: some View {
         LazyVStack(spacing: 0) {
@@ -269,8 +282,12 @@ struct MessagesFeed: View, Equatable {
                 .padding(.top, 40)
             } else {
                 ForEach(messages) { msg in
-                    MessageBubbleView(message: msg)
-                        .id(msg.id)
+                    MessageBubbleView(
+                        message: msg,
+                        // Повторяется только своё сообщение: у ответов ассистента повторять нечего.
+                        onRetry: msg.role == "user" ? { onRetry(msg.id) } : nil
+                    )
+                    .id(msg.id)
                 }
             }
         }
@@ -311,11 +328,11 @@ struct ChatInput: View {
     /// чистила черновик стора, а поле — нет. Во встроенном чате (вкладка хоста, экран не
     /// закрывается) набранный, но не отправленный текст прежнего пользователя оставался в
     /// поле следующего, и тот мог отправить его в свой тред.
-    static func draftBinding(for store: ChatStore) -> Binding<String> {
+    /// Привязка, которую поле ввода получает В САМОМ вью: тест читает её отсюда, поэтому
+    /// возврат текста в локальный `@State` роняет тест, а не проходит незамеченным.
+    var draft: Binding<String> {
         Binding(get: { store.draft }, set: { store.setDraft($0) })
     }
-
-    private var draft: Binding<String> { Self.draftBinding(for: store) }
 
     private var trimmed: String {
         store.draft.trimmingCharacters(in: .whitespacesAndNewlines)

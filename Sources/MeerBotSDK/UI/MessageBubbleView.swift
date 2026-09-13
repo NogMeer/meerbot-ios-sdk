@@ -4,6 +4,12 @@ import SwiftUI
 
 struct MessageBubbleView: View {
     let message: ChatMessage
+    /// Повторить отправку ЭТОГО сообщения. `nil` — повтор недоступен (не наша строка).
+    ///
+    /// Пузырь — единственное место, где повтор доступен всегда: баннер с «Повторить» живёт
+    /// только при ошибке связи, а недоставленным сообщение остаётся и после закрытия экрана
+    /// посреди отправки, когда никакой ошибки не было.
+    var onRetry: (() -> Void)?
 
     var body: some View {
         HStack {
@@ -47,9 +53,19 @@ struct MessageBubbleView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .opacity(message.failed ? 0.6 : 1)
                 if message.failed {
-                    Label("Не отправлено", systemImage: "exclamationmark.circle")
-                        .font(.caption2)
-                        .foregroundColor(.red)
+                    if let onRetry {
+                        Button(action: onRetry) {
+                            Label("Не отправлено. Повторить", systemImage: "arrow.clockwise.circle")
+                                .font(.caption2)
+                                .foregroundColor(.red)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Повторить отправку")
+                    } else {
+                        Label("Не отправлено", systemImage: "exclamationmark.circle")
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                    }
                 }
             }
             if message.role != "user" {

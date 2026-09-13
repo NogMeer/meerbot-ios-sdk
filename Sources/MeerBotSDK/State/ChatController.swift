@@ -59,6 +59,8 @@ public final class ChatController: ObservableObject {
     private var catchUpSuspended = false
     /// Номер текущей отправки — чтобы завершившаяся задача не обнулила ссылку на следующую.
     private var streamRunId = 0
+    /// Сколько смен строки устройства контроллер уже применил к ленте (см. `APIClient.deviceChanges`).
+    private var seenDeviceChanges = 0
     private var lifecycleSubscriptions = Set<AnyCancellable>()
 
     /// Периоды догона — те же, что у веб-виджета. `var` ради тестов: они ужимают их до
@@ -170,12 +172,28 @@ public final class ChatController: ObservableObject {
     /// повторять нечего: пометку снимает только слияние, узнавшее сообщение на сервере. Раньше
     /// здесь стоял запасной `send(text)`, и «Повторить» после такого слияния отправлял уже
     /// доставленное сообщение второй раз — с дублем в треде и вторым платным ответом модели.
+    ///
+    /// Условие — именно недоставленная строка, а не `retryableText`: повтор доступен и тапом по
+    /// пузырю, где баннера с текстом ошибки нет.
     public func retry() {
-        guard retryableText != nil else { return }
-        retryableText = nil
         guard let failed = store.messages.last(where: { $0.failed && $0.role == "user" }) else { return }
-        store.setFailed(id: failed.id, false)
-        run(text: failed.content, userMessageId: failed.id)
+        retry(messageId: failed.id)
+    }
+
+    /// Повторить КОНКРЕТНОЕ недоставленное сообщение (тап по пузырю).
+    ///
+    /// Отправка уже идёт или диалог закрыт — повтор молча игнорируется: второй поток поверх
+    /// первого сломал бы и `sending`, и плейсхолдер ответа.
+    func retry(messageId: String) {
+        guard !store.sending, store.mode != .closed else { return }
+        guard
+            let message = store.messages.first(where: { $0.id == messageId }),
+            message.role == "user",
+            message.failed
+        else { return }
+        retryableText = nil
+        store.setFailed(id: messageId, false)
+        run(text: message.content, userMessageId: messageId)
     }
 
     /// Открыть диалог по deep link из пуша.
@@ -344,8 +362,15 @@ public final class ChatController: ObservableObject {
                 let cursor = store.lastServerMessageId
                 let page = try await client.history(since: cursor > 0 ? cursor : nil, limit: 50)
                 guard identityEpoch == epoch else { return }
+                // Устройство сменило строку: курсор относился к прежнему диалогу, и страница,
+                // прочитанная по нему, к новому не подходит — читаем историю целиком.
+                if await applyDeviceChangeIfNeeded() {
+                    guard identityEpoch == epoch else { return }
+                    try await loadHistory()
+                    return
+                }
                 store.setMode(page.mode)
-                mergeServerPage(Self.map(page.messages))
+                mergeServerPage(page)
                 if !page.hasMore { break }
             }
             // Баннер снимаем только если повторять нечего: иначе с экрана исчезла бы кнопка
@@ -393,13 +418,16 @@ public final class ChatController: ObservableObject {
         let epoch = identityEpoch
         streamRunId += 1
         let runId = streamRunId
+        // Идентификатор отправки: сервер запишет сообщение под ним и узнает повтор, поэтому
+        // «Повторить» после обрыва не создаёт второго сообщения и второго платного ответа.
+        let clientMessageId = Self.clientMessageId(for: userMessageId)
         streamTask = Task { [weak self] in
             guard let self else { return }
             // Сервер закончил ответ сам (`[DONE]`, ошибка, таймаут, рестарт) — отличает
             // завершённый поток от оборванного отменой.
             var serverFinished = false
             do {
-                for try await event in await self.client.sendMessage(text) {
+                for try await event in await self.client.sendMessage(text, clientMessageId: clientMessageId) {
                     // Смена identity отменяет задачу, но кадр, уже лежащий в буфере потока,
                     // мог бы дойти — в ленту нового пользователя.
                     guard self.identityEpoch == epoch else { return }
@@ -413,7 +441,12 @@ public final class ChatController: ObservableObject {
                 // сообщение, чья регистрация ещё шла, пропадало без пометки, а в ленте
                 // оставался недописанный пузырь.
                 if Task.isCancelled, !serverFinished {
-                    self.settleCancelledSend(text: text, userMessageId: userMessageId, placeholderId: placeholder.id)
+                    self.settleCancelledSend(
+                        text: text,
+                        userMessageId: userMessageId,
+                        placeholderId: placeholder.id,
+                        runId: runId
+                    )
                     if self.streamRunId == runId { self.streamTask = nil }
                     return
                 }
@@ -429,13 +462,22 @@ public final class ChatController: ObservableObject {
                 // отправленному сообщению и ответу. Без него первый же тик поллинга принёс бы
                 // обе строки как «новые», и слияние держалось бы на совпадении текста.
                 await self.catchUp(silent: true)
+                guard self.identityEpoch == epoch else { return }
+                // Поток закончился, а ответа нет: сервер сохранил сообщение и сорвался
+                // (`generation_failed`, таймаут жизни потока). Сообщение при этом ДОШЛО —
+                // повтор идемпотентен по `clientMessageId` и либо догенерирует ответ, либо
+                // отдаст уже сохранённый.
+                if self.replyMissing(placeholderId: placeholder.id) {
+                    self.offerRetryIfUnanswered(userMessageId: userMessageId, text: text, runId: runId)
+                }
             } catch {
                 guard self.identityEpoch == epoch else { return }
                 await self.handleFailure(
                     error,
                     text: text,
                     userMessageId: userMessageId,
-                    placeholderId: placeholder.id
+                    placeholderId: placeholder.id,
+                    runId: runId
                 )
             }
             // Обнуляем ссылку, только если она всё ещё указывает на ЭТУ задачу: иначе
@@ -447,6 +489,24 @@ public final class ChatController: ObservableObject {
     }
 
     /// - Returns: `true` — событие завершает ответ со стороны сервера.
+    private func handle(_ event: StreamEvent, userMessageId: String, placeholderId: String) -> Bool {
+        switch event {
+        case let .event(published):
+            return handle(published, userMessageId: userMessageId, placeholderId: placeholderId)
+
+        case let .accepted(acceptance):
+            // Сервер прислал `clientMessageId` — он умеет идемпотентную отправку, и текстовое
+            // сопоставление своих сообщений ленте больше не нужно.
+            store.noteClientIdsSupported()
+            guard acceptance.clientMessageId.caseInsensitiveCompare(userMessageId) == .orderedSame
+            else { return false }
+            // Сообщение записано. Дальше обрыв уже не повод показывать «не отправлено» без
+            // проверки: повтор не создаст второй строки, а ответ может приехать догоном.
+            store.confirmUserMessage(localId: userMessageId, serverId: acceptance.userMessageId)
+            return false
+        }
+    }
+
     private func handle(_ event: ChatStreamEvent, userMessageId: String, placeholderId: String) -> Bool {
         switch event {
         case let .meta(id, mode):
@@ -521,43 +581,107 @@ public final class ChatController: ObservableObject {
         _ error: Error,
         text: String,
         userMessageId: String,
-        placeholderId: String
+        placeholderId: String,
+        runId: Int
     ) async {
         // Отменили САМУ отправку (`stop()`, новая отправка): смену identity отсекла сверка
         // эпохи до вызова. Разбор — тот же, что у отмены, закончившей поток без ошибки.
         // `.cancelled` при живой задаче — это исчерпанные попытки регистрации: запрос не ушёл,
         // и он идёт по обычной ветке ниже — к «Повторить».
         if Task.isCancelled {
-            settleCancelledSend(text: text, userMessageId: userMessageId, placeholderId: placeholderId)
+            settleCancelledSend(
+                text: text,
+                userMessageId: userMessageId,
+                placeholderId: placeholderId,
+                runId: runId
+            )
             return
         }
 
-        store.setSending(false)
+        let current = streamRunId == runId
+        if current { store.setSending(false) }
         store.finalizeAssistant(id: placeholderId)
         store.dropEmptyPlaceholder(id: placeholderId)
-        store.setError(Self.message(for: error))
+        if current { store.setError(Self.message(for: error)) }
         let epoch = identityEpoch
 
         // Диалог мог быть уже заведён, а ответ — дописан сервером, пока рвалось соединение.
         // Историю вливаем, а доставкой считаем только эхо ЭТОГО сообщения с ответом после
         // него. Раньше хватало «лента кончается ответом»: прошлый ответ бота выдавал
         // недошедшее сообщение за доставленное, замена ленты убирала его, и «Повторить» не было.
-        if await client.conversationId != nil, let items = try? await fetchHistory() {
+        if await client.conversationId != nil, let page = try? await client.history() {
             guard identityEpoch == epoch else { return }
-            mergeServerPage(items)
+            await applyDeviceChangeIfNeeded()
+            guard identityEpoch == epoch else { return }
+            // Режим — из истории: «диалог у менеджера» означает, что ответа от модели не будет
+            // вовсе, и сообщение считается устроенным без ответа.
+            store.setMode(page.mode)
+            mergeServerPage(page)
             if settleInterruptedReply(userMessageId: userMessageId, placeholderId: placeholderId) {
                 return
             }
         }
         guard identityEpoch == epoch else { return }
 
-        // Эхо сообщения уже в ленте (его принесла стартовая история или сверка выше), а
-        // ответа ещё нет: сообщение ДОСТАВЛЕНО, ответ приедет догоном. «Повторить» здесь
-        // отправил бы его второй раз — дубль в треде и второй платный ответ модели.
-        if isDelivered(userMessageId) { return }
+        settleUndelivered(text: text, userMessageId: userMessageId, applyBanner: current)
+    }
 
+    /// Что показать про сообщение, чья отправка кончилась ничем.
+    ///
+    /// Сервер подтвердил приём по `clientMessageId` — решает `isSettled`: за сообщением уже
+    /// есть строка (или диалог у менеджера) → пользователю повторять нечего; строки нет →
+    /// «Повторить» безопасно, потому что повтор идемпотентен.
+    ///
+    /// Подтверждения не было (старый сервер, хост со своими id) — прежнее осторожное правило:
+    /// доставкой считается только эхо, узнанное слиянием.
+    private func settleUndelivered(text: String, userMessageId: String, applyBanner: Bool) {
+        if store.isIdConfirmed(userMessageId) {
+            guard !store.isSettled(userMessageId) else { return }
+        } else if isDelivered(userMessageId) {
+            // Эхо сообщения уже в ленте (его принесла стартовая история или сверка выше), а
+            // ответа ещё нет: сообщение ДОСТАВЛЕНО, ответ приедет догоном. «Повторить» здесь
+            // отправил бы его второй раз — дубль в треде и второй платный ответ модели.
+            return
+        }
         store.setFailed(id: userMessageId, true)
-        retryableText = text
+        if applyBanner { retryableText = text }
+    }
+
+    /// Сервер сохранил сообщение, но ответа так и не дал. Повтор идемпотентен, поэтому
+    /// предлагаем его — но только пока за сообщением в треде ничего нет.
+    private func offerRetryIfUnanswered(userMessageId: String, text: String, runId: Int) {
+        guard store.isIdConfirmed(userMessageId), !store.isSettled(userMessageId) else { return }
+        store.setFailed(id: userMessageId, true)
+        if streamRunId == runId { retryableText = text }
+    }
+
+    /// Ответа на отправку в ленте нет: пузырь пуст или его уже убрали.
+    private func replyMissing(placeholderId: String) -> Bool {
+        store.messages.first(where: { $0.id == placeholderId })?.content.isEmpty ?? true
+    }
+
+    /// `clientMessageId` для отправки: id локальной строки в нижнем регистре.
+    ///
+    /// Строку мог создать хост со своим идентификатором — тогда идентификатора у отправки нет
+    /// и сервер идёт прежним путём: контракт требует UUID, а придумывать за хост новый id
+    /// нельзя, повтор должен нести ТОТ ЖЕ идентификатор.
+    private static func clientMessageId(for localId: String) -> String? {
+        guard UUID(uuidString: localId) != nil else { return nil }
+        return localId.lowercased()
+    }
+
+    /// Сервер выдал устройству другую строку: прежний диалог, курсор и серверные id к новой не
+    /// относятся. Сбрасываем ленту и читаем историю заново (полностью, не `since=`).
+    ///
+    /// - Returns: `true` — сброс выполнен.
+    @discardableResult
+    private func applyDeviceChangeIfNeeded() async -> Bool {
+        let changes = await client.deviceChanges
+        guard changes != seenDeviceChanges else { return false }
+        seenDeviceChanges = changes
+        store.resetForDeviceChange()
+        conversationId = nil
+        return true
     }
 
     /// Отправку отменили изнутри приложения — закрыли экран (`stop()`) или начали новую.
@@ -570,14 +694,16 @@ public final class ChatController: ObservableObject {
     ///
     /// Недописанный пузырь убирается: сервер на обрыв соединения прерывает генерацию, и
     /// обрывок окончательной версией не станет — что сервер сохранил, принесёт догон.
-    private func settleCancelledSend(text: String, userMessageId: String, placeholderId: String) {
-        store.setSending(false)
+    private func settleCancelledSend(text: String, userMessageId: String, placeholderId: String, runId: Int) {
+        // Отправку отменила НОВАЯ отправка: её `sending`, баннер и «Повторить» принадлежат уже
+        // ей, и эта, уходящая, задача их менять не имеет права. Пометку на своей строке она
+        // ставит всё равно — строка её собственная.
+        let current = streamRunId == runId
+        if current { store.setSending(false) }
         if store.messages.first(where: { $0.id == placeholderId })?.serverId == nil {
             store.removeMessage(id: placeholderId)
         }
-        guard !isDelivered(userMessageId) else { return }
-        store.setFailed(id: userMessageId, true)
-        retryableText = text
+        settleUndelivered(text: text, userMessageId: userMessageId, applyBanner: current)
     }
 
     /// Сервер узнал в строке своё сообщение (слияние проставило ей серверный id).
@@ -590,8 +716,17 @@ public final class ChatController: ObservableObject {
     /// Слияние снимает пометку «не доставлено» с сообщения, которое сервер всё-таки принял.
     /// `retryableText` при этом оставался, и кнопка вела в повтор уже доставленного. Теперь он
     /// следует за последней ещё недоставленной строкой, а если таких нет — снимается.
-    private func mergeServerPage(_ items: [ChatMessage]) {
-        store.mergeServerMessages(items)
+    private func mergeServerPage(_ page: HistoryPage) {
+        // Поддержку признаём по НАЛИЧИЮ ключа у строки пользователя (пусть и со значением
+        // `null`): по значению старый сервер не отличить от строк, записанных до 0.2.9.
+        if page.clientMessageIdsSupported { store.noteClientIdsSupported() }
+        var clientIds: [Int: String] = [:]
+        for item in page.messages {
+            if let clientMessageId = item.clientMessageId, !clientMessageId.isEmpty {
+                clientIds[item.id] = clientMessageId
+            }
+        }
+        store.mergeServerMessages(Self.map(page.messages), clientIds: clientIds)
         guard retryableText != nil else { return }
         retryableText = store.messages.last(where: { $0.failed && $0.role == "user" })?.content
     }
@@ -610,8 +745,12 @@ public final class ChatController: ObservableObject {
         let epoch = identityEpoch
         let page = try await client.history()
         guard identityEpoch == epoch else { return }
+        // Страница прочитана уже ПОСЛЕ регистрации, то есть новой строкой устройства: сброс
+        // ленты перед слиянием безопасен, полную историю можно вливать сразу.
+        await applyDeviceChangeIfNeeded()
+        guard identityEpoch == epoch else { return }
         store.setMode(page.mode)
-        mergeServerPage(Self.map(page.messages))
+        mergeServerPage(page)
     }
 
     /// Сервер дописал ответ на прерванную отправку: сообщение получило серверный id, и после
@@ -633,12 +772,6 @@ public final class ChatController: ObservableObject {
             store.removeMessage(id: placeholderId)
         }
         return true
-    }
-
-    /// Полный тред диалога с сервера (не инкремент: сверка «ответ дописан» смотрит на
-    /// строки после сообщения, и обрезанная страница их бы не содержала).
-    private func fetchHistory() async throws -> [ChatMessage] {
-        Self.map(try await client.history().messages)
     }
 
     /// Автор берётся из ответа сервера, а не выводится из роли.

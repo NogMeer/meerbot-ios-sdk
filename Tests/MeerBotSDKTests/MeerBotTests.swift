@@ -278,7 +278,7 @@ final class MeerBotTests: XCTestCase {
         sdk.identify(token: makeIdentityJWT(sub: "user-a"))
         await sdk.identityTask?.value
         let store = try XCTUnwrap(sdk.chatController()).store
-        let field = ChatInput.draftBinding(for: store)
+        let field = draftBindingOfChatInput(store)
 
         field.wrappedValue = "черновик user-a"
         sdk.identify(token: nil)

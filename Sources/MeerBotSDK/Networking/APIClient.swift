@@ -4,7 +4,7 @@
 //
 // ОДИН ключ `pk_live_*` мобильного приложения и три эндпоинта СВОЕГО канала:
 //   POST /api/v1/mobile/register     — регистрация устройства → JWT (claim `ch=mobile_app`)
-//   POST /api/v1/mobile/chat/stream  — SSE-поток ответа (тело: {message})
+//   POST /api/v1/mobile/chat/stream  — SSE-поток ответа (тело: {message, clientMessageId?})
 //   GET  /api/v1/mobile/messages     — догон истории (?since&limit)
 //
 // ── Что изменилось против 0.1.x и почему ────────────────────────────────────────────────
@@ -113,6 +113,11 @@ public enum MeerBotError: Error, LocalizedError {
                 return "Достигнут месячный лимит новых обращений."
             case "rate_limited":
                 return "Слишком много сообщений. Попробуйте через минуту."
+            case "generation_in_progress":
+                // Повтор с тем же `clientMessageId` пришёл, пока ответ на это сообщение ещё
+                // генерируется другим запросом. Сообщение УЖЕ у сервера — «Повторить» здесь
+                // не про потерю, а про ожидание: ответ приедет догоном сам.
+                return "Ответ ещё готовится. Повторите чуть позже."
             case "message_too_long":
                 return "Сообщение слишком длинное."
             case "channel_mismatch", "device_claim_missing", "device_not_found":
@@ -182,6 +187,11 @@ public struct HistoryMessage: Equatable {
     public let authorKind: String?
     /// Подпись менеджера для UI. Может быть `nil` даже при `authorKind == "manager"`.
     public let authorName: String?
+    /// `clientMessageId`, с которым это сообщение отправило устройство — у строк `role: "user"`
+    /// на сервере 0.2.9+. `nil` — строка записана до этой версии, ответ ассистента (у них поля
+    /// нет вовсе) или сервер старый. Ключ узнавания своего сообщения в ленте: он точный, в
+    /// отличие от сравнения текста.
+    public let clientMessageId: String?
 
     public init(
         id: Int,
@@ -189,7 +199,8 @@ public struct HistoryMessage: Equatable {
         content: String,
         createdAt: Date?,
         authorKind: String? = nil,
-        authorName: String? = nil
+        authorName: String? = nil,
+        clientMessageId: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -197,6 +208,7 @@ public struct HistoryMessage: Equatable {
         self.createdAt = createdAt
         self.authorKind = authorKind
         self.authorName = authorName
+        self.clientMessageId = clientMessageId
     }
 }
 
@@ -206,6 +218,25 @@ public struct HistoryPage: Equatable {
     public let messages: [HistoryMessage]
     public let hasMore: Bool
     public let mode: ChatMode
+    /// Сервер умеет `clientMessageId` в истории: хотя бы у одной строки `role: "user"` ключ
+    /// ЕСТЬ — пусть даже со значением `null` (строка записана до 0.2.9).
+    ///
+    /// Внутреннее: признак нужен слиянию (на таком сервере сопоставлять сообщения
+    /// пользователя по тексту больше нельзя), а хосту — нет. Пустая страница поддержки не
+    /// доказывает, поэтому флаг только поднимается и никогда не сбрасывается.
+    let clientMessageIdsSupported: Bool
+
+    init(
+        messages: [HistoryMessage],
+        hasMore: Bool,
+        mode: ChatMode,
+        clientMessageIdsSupported: Bool = false
+    ) {
+        self.messages = messages
+        self.hasMore = hasMore
+        self.mode = mode
+        self.clientMessageIdsSupported = clientMessageIdsSupported
+    }
 }
 
 // MARK: - Отложенный выход
@@ -232,6 +263,16 @@ public struct HistoryPage: Equatable {
 /// ключа ещё нет, а строка устройства на сервере ключуется идентификатором установки.
 struct IdentityFlagStore {
     static let pendingLogoutKey = "meerbot.pendingLogout"
+    /// Счётчик смен identity: `"<installationId>|<n>"`.
+    static let identitySeqKey = "meerbot.identitySeq"
+    /// Потолок счётчика — `int4` на сервере. Дойти до него за срок жизни установки нельзя,
+    /// но обрезать надёжнее, чем прислать значение, которое сервер отвергнет как `invalid_input`.
+    static let maxIdentitySeq = 2_147_483_647
+
+    /// Чтение-инкремент-запись одного счётчика в `UserDefaults` не атомарны, а зовут их и
+    /// главный актор (`MeerBot.identify`), и актор клиента (`applyIdentity`) — без замка два
+    /// параллельных выхода записали бы одно и то же значение, и порядок на сервере разъехался бы.
+    private static let seqLock = NSLock()
 
     let defaults: UserDefaults
 
@@ -251,8 +292,50 @@ struct IdentityFlagStore {
         return raw
     }
 
+    /// Пометить выход. Счётчик смен растёт ЗДЕСЬ же: сервер сравнивает по нему порядок
+    /// событий identity вместо часов устройства, и каждый выход и каждая смена человека
+    /// обязаны получить номер больше предыдущего. Все места, которые ставят флаг, — это
+    /// ровно все смены; свежий токен того же человека сюда не заходит и номер не двигает.
     func markLogout(installationId: String) {
         defaults.set("\(installationId)|\(UUID().uuidString)", forKey: Self.pendingLogoutKey)
+        bumpIdentitySeq(installationId: installationId)
+    }
+
+    /// Текущий номер смены этой установки. Чужой префикс (флаг остался от прежней установки
+    /// после `reset()`) — это 0: номера прежней установки к новой строке устройства не
+    /// относятся, а сервер там ничего не хранит.
+    func identitySeq(installationId: String) -> Int {
+        Self.seqLock.lock(); defer { Self.seqLock.unlock() }
+        return readIdentitySeq(installationId: installationId)
+    }
+
+    /// Сервер хранит номер больше нашего (`identity.seq` в ответе регистрации): счётчик на
+    /// устройстве отстал — например, `UserDefaults` восстановили из бэкапа. Поднимаем до
+    /// серверного, иначе следующая смена ушла бы с номером, который сервер отбросит как старый.
+    func raiseIdentitySeq(to seq: Int, installationId: String) {
+        Self.seqLock.lock(); defer { Self.seqLock.unlock() }
+        guard seq > readIdentitySeq(installationId: installationId) else { return }
+        writeIdentitySeq(min(seq, Self.maxIdentitySeq), installationId: installationId)
+    }
+
+    private func bumpIdentitySeq(installationId: String) {
+        Self.seqLock.lock(); defer { Self.seqLock.unlock() }
+        let next = readIdentitySeq(installationId: installationId) + 1
+        writeIdentitySeq(min(next, Self.maxIdentitySeq), installationId: installationId)
+    }
+
+    /// Звать под `seqLock`.
+    private func readIdentitySeq(installationId: String) -> Int {
+        guard
+            let raw = defaults.string(forKey: Self.identitySeqKey),
+            raw.hasPrefix(installationId + "|"),
+            let value = Int(raw.dropFirst(installationId.count + 1))
+        else { return 0 }
+        return max(0, value)
+    }
+
+    private func writeIdentitySeq(_ value: Int, installationId: String) {
+        defaults.set("\(installationId)|\(value)", forKey: Self.identitySeqKey)
     }
 
     /// Снять флаг, только если он всё ещё тот, что ушёл на сервер.
@@ -263,6 +346,9 @@ struct IdentityFlagStore {
 
     func clearAll() {
         defaults.removeObject(forKey: Self.pendingLogoutKey)
+        // Номер смены относится к строке устройства ПРЕЖНЕЙ установки: `reset()` заводит новый
+        // идентификатор установки, и на сервере эта строка начинается с чистого листа.
+        defaults.removeObject(forKey: Self.identitySeqKey)
     }
 }
 
@@ -357,6 +443,17 @@ public actor APIClient {
     public private(set) var conversationId: Int?
     /// id последнего известного сообщения — точка догона после обрыва.
     public private(set) var lastMessageId: Int?
+
+    /// Серверный id устройства из последней принятой регистрации.
+    private var knownDeviceId: String?
+    /// Сколько раз регистрация вернула ДРУГОЙ id устройства, чем прежняя.
+    ///
+    /// Тред диалога ключуется на строке устройства, поэтому другой id — это другая переписка:
+    /// лента, курсор и `conversationId` прежней к ней не относятся. Считаем смены, а не ставим
+    /// флаг: контроллер сверяет значение со своим и не пропустит две смены подряд.
+    /// Смена identity счётчик не двигает — там ленту чистит сама смена (`knownDeviceId` ниже
+    /// обнуляется, и первая регистрация после неё сменой устройства не считается).
+    private(set) var deviceChanges = 0
 
     public init(
         config: MeerBotConfiguration,
@@ -463,6 +560,10 @@ public actor APIClient {
         conversationId = nil
         lastMessageId = nil
         identityStatus = .notProvided
+        // Новая identity — новая строка устройства на сервере, и это ОЖИДАЕМО: ленту чистит
+        // сама смена. Без обнуления первая регистрация после неё выглядела бы сменой
+        // устройства, и контроллер сбросил бы уже новую ленту второй раз.
+        knownDeviceId = nil
     }
 
     /// Ключ сравнения «тот же человек»: `sub`, а без него — сам токен.
@@ -497,6 +598,9 @@ public actor APIClient {
         let startedGeneration = generation
         let startedRevision = tokenRevision
         let logoutSent = flagStore.pendingLogout(installationId: installationId)
+        // Номер смены identity — из того же снимка состояния, что и флаг выхода: сервер
+        // сравнивает порядок событий по нему, и он обязан описывать ИМЕННО это тело.
+        let seqSent = flagStore.identitySeq(installationId: installationId)
 
         var request = makeRequest(path: "/api/v1/mobile/register", method: "POST")
         var body: [String: Any] = [
@@ -506,6 +610,10 @@ public actor APIClient {
             "platform": "ios",
             "visitorUuid": visitorUuid,
             "sdkVersion": config.sdkVersion,
+            // Порядок смен identity БЕЗ часов: устройство могло отправить выход и новый вход из
+            // разных сетей, и приехать они могут в обратном порядке. Сервер применяет только
+            // номер не меньше сохранённого. Старый сервер поле игнорирует.
+            "identitySeq": seqSent,
         ]
         if let identityToken { body["identityToken"] = identityToken }
         // Отдельное поле, а не `identityToken: null`: у сервера поле токена — строка, и
@@ -513,7 +621,7 @@ public actor APIClient {
         if logoutSent != nil { body["logout"] = true }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let data = try await perform(request)
+        let data = try await perform(request, retryingUnavailable: true)
         guard generation == startedGeneration else { return nil }
         guard
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -529,6 +637,24 @@ public actor APIClient {
         let identity = json["identity"] as? [String: Any]
         let status = (identity?["status"] as? String)
             .flatMap(IdentityStatus.init(rawValue:)) ?? .notProvided
+
+        // Сервер знает номер смены БОЛЬШЕ отправленного: наш счётчик отстал (например,
+        // `UserDefaults` восстановили из бэкапа), и сервер этот запрос для identity не применил
+        // вовсе. Поднимаем счётчик и считаем попытку несостоявшейся: `openSession` повторит её,
+        // и второе тело уйдёт уже с номером, который сервер примет. Флаг выхода не снимаем —
+        // его тоже не применили.
+        if let serverSeq = identity?["seq"] as? Int, serverSeq > seqSent {
+            flagStore.raiseIdentitySeq(to: serverSeq, installationId: installationId)
+            return nil
+        }
+
+        // Другая строка устройства — другой тред: лента и курсор прежней к ней не относятся.
+        if let knownDeviceId, knownDeviceId != deviceId {
+            deviceChanges += 1
+            conversationId = nil
+            lastMessageId = nil
+        }
+        knownDeviceId = deviceId
         // Токен того же человека обновился в полёте: этот JWT отдаём ждущему запросу (связь
         // та же), но не кэшируем — следующий запрос зарегистрируется уже со свежим токеном.
         // Статус тоже не публикуем: он о СТАРОМ токене, и `stale` устаревшего токена,
@@ -612,19 +738,25 @@ public actor APIClient {
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        // Поддержка `clientMessageId` — это НАЛИЧИЕ ключа у строки пользователя, а не его
+        // значение: у строк, записанных до 0.2.9, сервер отдаёт `null`, и по значению старый
+        // сервер (ключа нет вовсе) от нового было бы не отличить.
+        var clientIdsSupported = false
         let messages = raw.compactMap { item -> HistoryMessage? in
             guard
                 let id = item["id"] as? Int,
                 let role = item["role"] as? String,
                 let content = item["content"] as? String
             else { return nil }
+            if role == "user", item.keys.contains("clientMessageId") { clientIdsSupported = true }
             return HistoryMessage(
                 id: id,
                 role: role,
                 content: content,
                 createdAt: (item["createdAt"] as? String).flatMap { formatter.date(from: $0) },
                 authorKind: item["authorKind"] as? String,
-                authorName: item["authorName"] as? String
+                authorName: item["authorName"] as? String,
+                clientMessageId: item["clientMessageId"] as? String
             )
         }
         if let last = messages.last?.id { lastMessageId = last }
@@ -632,7 +764,8 @@ public actor APIClient {
         return HistoryPage(
             messages: messages,
             hasMore: (json["hasMore"] as? Bool) ?? false,
-            mode: ChatMode(rawValue: (json["mode"] as? String) ?? "") ?? .ai
+            mode: ChatMode(rawValue: (json["mode"] as? String) ?? "") ?? .ai,
+            clientMessageIdsSupported: clientIdsSupported
         )
     }
 
@@ -645,10 +778,35 @@ public actor APIClient {
     /// Истёкший JWT (401 `jwt_*`) или снятое с регистрации устройство (401 `device_*`)
     /// обновляются прозрачно, запрос повторяется РОВНО один раз.
     public func sendMessage(_ text: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        // Публичный поток отдаёт только публичные события: подтверждение приёма — внутреннее
+        // (см. `StreamAcceptance`), и хост, разбирающий поток сам, о нём знать не должен.
+        stream(text: text, clientMessageId: nil) { event in
+            guard case let .event(published) = event else { return nil }
+            return published
+        }
+    }
+
+    /// Отправить сообщение с идемпотентным `clientMessageId` (UUID в нижнем регистре).
+    ///
+    /// Повтор с тем же id сервер не запишет вторым сообщением: он отдаст `meta` с
+    /// `replayed: true` и уже сохранённый ответ. Поток несёт ещё и `.accepted` — момент, когда
+    /// сервер подтвердил приём; с этого момента «Повторить» безопасно, а сообщение не потеряно,
+    /// даже если соединение оборвётся сразу после.
+    func sendMessage(_ text: String, clientMessageId: String?) -> AsyncThrowingStream<StreamEvent, Error> {
+        stream(text: text, clientMessageId: clientMessageId) { $0 }
+    }
+
+    private func stream<Element: Sendable>(
+        text: String,
+        clientMessageId: String?,
+        map: @escaping @Sendable (StreamEvent) -> Element?
+    ) -> AsyncThrowingStream<Element, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await runStream(text: text, allowRetry: true, continuation: continuation)
+                    try await runStream(text: text, clientMessageId: clientMessageId, allowRetry: true) { event in
+                        if let element = map(event) { continuation.yield(element) }
+                    }
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish(throwing: MeerBotError.cancelled)
@@ -662,14 +820,18 @@ public actor APIClient {
 
     private func runStream(
         text: String,
+        clientMessageId: String?,
         allowRetry: Bool,
-        continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation
+        allowUnavailableRetry: Bool = true,
+        yield: (StreamEvent) -> Void
     ) async throws {
         var request = makeRequest(path: "/api/v1/mobile/chat/stream", method: "POST")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")
-        // Тело — только текст: диалог выбирает сервер по устройству из токена.
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["message": text])
+        // Тело — текст и идентификатор отправки: диалог выбирает сервер по устройству из токена.
+        var body: [String: Any] = ["message": text]
+        if let clientMessageId { body["clientMessageId"] = clientMessageId }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (bytes, response): (URLSession.AsyncBytes, URLResponse)
         do {
@@ -689,12 +851,45 @@ public actor APIClient {
             // другого канала, и перевыпуск его не исправит.
             if Self.isRecoverableBySession(status: http.statusCode, code: error.code), allowRetry {
                 invalidateToken()
-                try await runStream(text: text, allowRetry: false, continuation: continuation)
+                // Повтор несёт ТОТ ЖЕ `clientMessageId`: иначе перерегистрация превратила бы
+                // одну отправку в два сообщения в треде и два платных ответа модели.
+                try await runStream(
+                    text: text,
+                    clientMessageId: clientMessageId,
+                    allowRetry: false,
+                    allowUnavailableRetry: allowUnavailableRetry,
+                    yield: yield
+                )
+                return
+            }
+            // Сервер занят (перезапуск, конфликт регистрации) и сам назвал паузу. Повтор
+            // безопасен ровно здесь — до первого байта потока ответ ещё не начался.
+            if http.statusCode == 503, allowUnavailableRetry {
+                try await Self.waitBeforeUnavailableRetry(http)
+                try await runStream(
+                    text: text,
+                    clientMessageId: clientMessageId,
+                    allowRetry: allowRetry,
+                    allowUnavailableRetry: false,
+                    yield: yield
+                )
                 return
             }
             throw error
         }
 
+        // Отмена обязана рвать СОЕДИНЕНИЕ, а не только цикл чтения: пока запрос жив, сервер
+        // генерирует (и тарифицирует) ответ, которого никто не прочитает, а `URLSession`
+        // держит соединение. `stop()` и закрытие экрана происходят посреди генерации регулярно.
+        let dataTask = bytes.task
+        try await withTaskCancellationHandler {
+            try await consume(bytes, yield: yield)
+        } onCancel: {
+            dataTask.cancel()
+        }
+    }
+
+    private func consume(_ bytes: URLSession.AsyncBytes, yield: (StreamEvent) -> Void) async throws {
         let parser = SSEParser()
         var buffer = Data()
         buffer.reserveCapacity(4096)
@@ -704,7 +899,7 @@ public actor APIClient {
                 buffer.append(byte)
                 guard byte == 0x0A else { continue } // граница события возможна только после \n
                 for event in parser.feed(buffer) {
-                    emit(event, to: continuation)
+                    emit(event, yield: yield)
                 }
                 buffer.removeAll(keepingCapacity: true)
             }
@@ -714,25 +909,27 @@ public actor APIClient {
 
         if !buffer.isEmpty {
             for event in parser.feed(buffer) {
-                emit(event, to: continuation)
+                emit(event, yield: yield)
             }
         }
         // Поток закрылся без завершающей пустой строки — добираем последний блок.
         for event in parser.flush() {
-            emit(event, to: continuation)
+            emit(event, yield: yield)
         }
     }
 
-    private func emit(
-        _ raw: SSEEvent,
-        to continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation
-    ) {
+    private func emit(_ raw: SSEEvent, yield: (StreamEvent) -> Void) {
         guard let event = ChatStreamEvent.from(raw) else { return }
         if case let .meta(id, _) = event, id > 0 { conversationId = id }
         if case let .managerMessage(message) = event, message.messageId > 0 {
             lastMessageId = message.messageId
         }
-        continuation.yield(event)
+        yield(.event(event))
+        // Подтверждение приёма идёт СРАЗУ за своим `meta`: контроллер к этому моменту уже
+        // применил режим и id диалога, и строка ленты ждёт только серверного id.
+        if let acceptance = ChatStreamEvent.acceptance(from: raw) {
+            yield(.accepted(acceptance))
+        }
     }
 
     // MARK: Транспорт
@@ -753,7 +950,10 @@ public actor APIClient {
     }
 
     /// Запрос без Authorization (регистрация устройства).
-    private func perform(_ request: URLRequest) async throws -> Data {
+    ///
+    /// `retryingUnavailable` — один повтор на 503 (`Retry-After`). Включается там, где повтор
+    /// не может продублировать запись: регистрация идемпотентна по `installationId`.
+    private func perform(_ request: URLRequest, retryingUnavailable: Bool = false) async throws -> Data {
         let data: Data
         let response: URLResponse
         do {
@@ -763,9 +963,40 @@ public actor APIClient {
         }
         guard let http = response as? HTTPURLResponse else { throw MeerBotError.invalidResponse }
         if http.statusCode >= 400 {
+            // 503 сервер отдаёт, когда занят и сам называет паузу (перезапуск, конкурентная
+            // регистрация того же устройства). Второй отказ отдаём наверх: дальше ждать —
+            // это держать пользователя на пустом экране.
+            if http.statusCode == 503, retryingUnavailable {
+                try await Self.waitBeforeUnavailableRetry(http)
+                return try await perform(request, retryingUnavailable: false)
+            }
             throw Self.decodeError(status: http.statusCode, data: data)
         }
         return data
+    }
+
+    /// Потолок паузы перед повтором: дольше ждать молча нельзя — экран уже пустой.
+    static let unavailableRetryCap: TimeInterval = 5
+
+    /// Пауза перед единственным повтором после 503. Чистая функция: `jitter` (0…1) передаётся
+    /// снаружи, чтобы тест считал ту же величину, что и рантайм.
+    static func unavailableRetryDelay(retryAfter: String?, jitter: Double) -> TimeInterval {
+        // Заголовка нет или он в форме HTTP-даты (её мобильный роут не шлёт) — секунда:
+        // заметно меньше потолка и достаточно, чтобы не попасть в тот же миг перезапуска.
+        let requested = retryAfter.flatMap { Double($0.trimmingCharacters(in: .whitespaces)) } ?? 1
+        let base = min(max(requested, 0), unavailableRetryCap)
+        // Джиттер пропорционален паузе: он разводит разбуженные разом устройства, но при
+        // `Retry-After: 0` (сервер готов сразу) не выдумывает ожидание из ничего.
+        return base + base * 0.1 * min(max(jitter, 0), 1)
+    }
+
+    private static func waitBeforeUnavailableRetry(_ http: HTTPURLResponse) async throws {
+        let delay = unavailableRetryDelay(
+            retryAfter: http.value(forHTTPHeaderField: "Retry-After"),
+            jitter: Double.random(in: 0...1)
+        )
+        guard delay > 0 else { return }
+        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
     /// Запрос с Authorization: 401 по протухшему JWT или снятому устройству обновляет сессию

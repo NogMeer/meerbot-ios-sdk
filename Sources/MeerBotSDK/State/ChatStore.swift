@@ -12,7 +12,7 @@ public enum ChatMode: String, Codable {
     case closed
 }
 
-public struct ChatMessage: Identifiable, Equatable {
+public struct ChatMessage: Identifiable, Equatable, Sendable {
     public let id: String
     /// id строки на сервере — ключ слияния при догоне ленты.
     ///
@@ -81,7 +81,43 @@ public final class ChatStore: ObservableObject {
     /// курсора на момент отправки не было — история ещё не пришла).
     static let echoClockTolerance: TimeInterval = 5 * 60
 
+    /// Локальные строки, про которые сервер сказал «записал» — по `clientMessageId`, а не по
+    /// совпадению текста. Такое сопоставление точное, и догадки (`echoFloors`, часы, текст)
+    /// к ним больше не применяются.
+    private var idConfirmed: Set<String> = []
+
+    /// Сервер понимает `clientMessageId` (прислал его в `meta` или отдал ключ в истории).
+    ///
+    /// Только поднимается: один ответ старого узла за балансировщиком не должен вернуть
+    /// экран к сопоставлению по тексту, когда точное сопоставление уже работало.
+    private(set) var clientIdsSupported: Bool = false
+
     public init() {}
+
+    /// Сервер поддерживает идемпотентную отправку.
+    func noteClientIdsSupported() { clientIdsSupported = true }
+
+    /// Сервер подтвердил приём локальной строки: `clientMessageId` совпал, строка получила
+    /// серверный id. Курсор НЕ двигаем — он курсор ленты, а не отправки; `failed` не трогаем:
+    /// снимет его нормализация, когда станет видно, что за сообщением уже есть ответ.
+    func confirmUserMessage(localId: String, serverId: Int) {
+        guard let idx = messages.firstIndex(where: { $0.id == localId }) else { return }
+        if messages[idx].serverId == nil { messages[idx].serverId = serverId }
+        idConfirmed.insert(localId)
+        echoFloors[localId] = nil
+    }
+
+    /// Строка подтверждена сервером по `clientMessageId`.
+    func isIdConfirmed(_ localId: String) -> Bool { idConfirmed.contains(localId) }
+
+    /// За сообщением на сервере уже что-то есть — значит, ответ либо пришёл, либо не придёт
+    /// автоматически (диалог у человека), и повторять отправку нечего.
+    func isSettled(_ localId: String) -> Bool {
+        guard let message = messages.first(where: { $0.id == localId }) else { return false }
+        if mode == .human || mode == .pendingEscalation { return true }
+        guard let serverId = message.serverId else { return false }
+        return messages.contains { ($0.serverId ?? 0) > serverId }
+    }
 
     public func setDraft(_ text: String) { draft = text }
 
@@ -162,6 +198,7 @@ public final class ChatStore: ObservableObject {
     public func removeMessage(id: String) {
         messages.removeAll { $0.id == id }
         echoFloors[id] = nil
+        idConfirmed.remove(id)
     }
 
     /// Заменить всю ленту.
@@ -172,6 +209,7 @@ public final class ChatStore: ObservableObject {
     public func replaceAll(_ items: [ChatMessage]) {
         messages = items
         echoFloors.removeAll()
+        idConfirmed.removeAll()
         bumpCursor(items)
     }
 
@@ -200,12 +238,48 @@ public final class ChatStore: ObservableObject {
     /// - Returns: сколько сообщений реально появилось в ленте.
     @discardableResult
     public func mergeServerMessages(_ items: [ChatMessage]) -> Int {
+        mergeServerMessages(items, clientIds: [:])
+    }
+
+    /// Тот же метод, но со связкой `serverId → clientMessageId` из ответа сервера.
+    ///
+    /// Сопоставление по id точное и идёт ПЕРЕД текстовым: строка со своим `clientMessageId`
+    /// узнаётся вне зависимости от текста, курсора, часов и стриминга, а серверная строка с
+    /// ЧУЖИМ id по тексту не сопоставляется никогда — иначе два человека, написавшие «да» в
+    /// одном треде с одного устройства до и после входа, перепутались бы местами.
+    @discardableResult
+    func mergeServerMessages(_ items: [ChatMessage], clientIds: [Int: String]) -> Int {
         var recognized = Set<Int>()
+        var promoted: [String] = []
         for (index, item) in items.enumerated().reversed() {
             if let sid = item.serverId, messages.contains(where: { $0.serverId == sid }) {
                 recognized.insert(index)
                 continue
             }
+
+            let itemClientId = item.serverId.flatMap { clientIds[$0] }
+            if let itemClientId, !itemClientId.isEmpty {
+                if let localIdx = messages.firstIndex(where: {
+                    $0.serverId == nil && $0.role == item.role
+                        && $0.id.caseInsensitiveCompare(itemClientId) == .orderedSame
+                }) {
+                    messages[localIdx].serverId = item.serverId
+                    echoFloors[messages[localIdx].id] = nil
+                    idConfirmed.insert(messages[localIdx].id)
+                    promoted.append(messages[localIdx].id)
+                    recognized.insert(index)
+                }
+                // Идентификатор у строки есть, но локального двойника нет — это чужая строка
+                // (другое устройство, другой пользователь). Текстовое сопоставление к ней не
+                // применяем: оно бы забрало ни в чём не виноватое локальное сообщение.
+                continue
+            }
+
+            // Сервер знает `clientMessageId`, но у этой строки пользователя его нет — значит,
+            // она записана до 0.2.9 (или другим клиентом). Своей она быть не может: всё, что
+            // отправил этот экран, ушло с идентификатором.
+            if clientIdsSupported, item.role == "user" { continue }
+
             // Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов, а в
             // потоке они приходят (первым чанком часто идёт перевод строки). Точное равенство
             // роняло слияние в дубль ровно на таких ответах.
@@ -230,6 +304,11 @@ public final class ChatStore: ObservableObject {
             added += 1
         }
         bumpCursor(items)
+        // Пометку «не отправлено» снимаем только теперь: до вставки остальных строк страницы
+        // не видно, есть ли за сообщением ответ.
+        for localId in promoted where isSettled(localId) {
+            setFailed(id: localId, false)
+        }
         return added
     }
 
@@ -298,11 +377,28 @@ public final class ChatStore: ObservableObject {
     func resetForIdentityChange() {
         messages.removeAll()
         echoFloors.removeAll()
+        idConfirmed.removeAll()
         mode = .ai
         operatorTyping = nil
         draft = ""
         sending = false
         connectionError = nil
+        lastServerMessageId = 0
+    }
+
+    /// Сервер выдал устройству ДРУГУЮ строку (прежнюю увели в отставку): у неё свой диалог,
+    /// и серверные id прежнего треда к нему не относятся — курсор с ними запросил бы чужие
+    /// сообщения, а лежащие в ленте серверные строки к новому диалогу не относятся вовсе.
+    ///
+    /// Неподтверждённые сообщения пользователя ОСТАЮТСЯ в ленте (с пометкой недоставленных их
+    /// оставит контроллер): набранный и отправленный текст нельзя терять молча — он принадлежит
+    /// тому же человеку, устройство просто сменило строку.
+    func resetForDeviceChange() {
+        messages.removeAll { $0.serverId != nil || $0.streaming || $0.role != "user" }
+        echoFloors.removeAll()
+        idConfirmed.removeAll()
+        mode = .ai
+        operatorTyping = nil
         lastServerMessageId = 0
     }
 }

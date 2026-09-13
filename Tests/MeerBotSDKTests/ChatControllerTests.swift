@@ -762,7 +762,7 @@ final class ChatControllerTests: XCTestCase {
     /// вошёл B. Поле держало свой `@State`, и текст A оставался в поле B.
     func testСменаIdentityСтираетТекстВПолеВвода() {
         let controller = makeController()
-        let field = ChatInput.draftBinding(for: controller.store)
+        let field = draftBindingOfChatInput(controller.store)
         field.wrappedValue = "мой номер договора 123"
         XCTAssertEqual(controller.store.draft, "мой номер договора 123", "поле пишет в стор")
 
