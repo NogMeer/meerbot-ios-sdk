@@ -6,8 +6,10 @@ import XCTest
 @testable import MeerBotSDK
 
 /// Неподписанный JWT с нужным `sub`: SDK подпись не проверяет, ему нужен только payload.
+/// `.sortedKeys` обязателен: порядок ключей `Dictionary` между экземплярами не гарантирован,
+/// и два вызова с одними аргументами давали разные строки — тесты сравнивают их на равенство.
 func makeIdentityJWT(sub: String, iat: Int = 1) -> String {
-    let payload = try! JSONSerialization.data(withJSONObject: ["sub": sub, "iat": iat])
+    let payload = try! JSONSerialization.data(withJSONObject: ["sub": sub, "iat": iat], options: .sortedKeys)
     let encoded = payload.base64EncodedString()
         .replacingOccurrences(of: "+", with: "-")
         .replacingOccurrences(of: "/", with: "_")
