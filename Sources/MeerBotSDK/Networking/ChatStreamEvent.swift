@@ -6,17 +6,18 @@
 //   (без event)                 → OpenAI-совместимый чанк {choices:[{delta:{content}}]}
 //   data: [DONE]                → генерация AI завершена
 //   event: manager_message      → {messageId, role, text, authorName, createdAt}
+//   event: escalation           → {triggered, reason} — позвали человека (модель, просьба
+//                                 пользователя или обещание в ответе). Шлётся, если у
+//                                 приложения включена эскалация в инбокс или в Telegram;
+//                                 SDK переключает `mode` в `pendingEscalation`
 //   event: forwarded_to_manager → {mode} — диалог ведёт менеджер, модель не звалась
 //   event: heartbeat            → {} каждые 15 с
 //   event: error                → {code, message}
 //   event: timeout              → достигнут max lifetime (30 мин)
 //   event: shutdown             → плановый рестарт сервера, НЕ сетевой сбой
 //
-// Разбираются, но мобильным каналом СЕГОДНЯ не шлются — оставлены, потому что стоят дешевле
-// молчаливого пропуска, если появятся:
-//   event: escalation           → у канала эскалация в инбокс выключена (`escalateToInbox`
-//                                 в capabilities = false), флаг «нужен человек» ставится
-//                                 молча, и пользователю менеджера не обещают;
+// Разбирается, но мобильным каналом СЕГОДНЯ не шлётся — оставлено, потому что стоит дешевле
+// молчаливого пропуска, если появится:
 //   event: usage                → квота кабинетного хелп-виджета, мобильному не адресована.
 
 import Foundation
