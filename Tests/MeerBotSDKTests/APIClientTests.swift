@@ -317,7 +317,8 @@ final class APIClientTests: XCTestCase {
     /// Хост выпускает свежий токен на каждый вход в чат. Два таких вызова во время отправки
     /// раньше исчерпывали попытки регистрации, и сообщение не уходило.
     func testСвежийТокенТогоЖеЧеловекаНеОтбрасываетРегистрациюВПолёте() async throws {
-        stubRegister(jwt: "jwt-first", identityStatus: "stale", delay: 0.3)
+        // Первый токен экземпляра ставит выход; сервер его подтверждает в первом же ответе.
+        stubRegister(jwt: "jwt-first", identityStatus: "stale", unlinked: true, delay: 0.3)
         stubRegister(jwt: "jwt-fresh", identityStatus: "verified")
         let client = makeClient()
         await client.setIdentityToken(makeIdentityJWT(sub: "user-42", iat: 1))
@@ -337,7 +338,42 @@ final class APIClientTests: XCTestCase {
             registerBodies().last?["identityToken"] as? String,
             makeIdentityJWT(sub: "user-42", iat: 3)
         )
-        XCTAssertFalse(logoutPending, "обновление токена — не смена человека")
+        XCTAssertNil(registerBodies().last?["logout"], "обновление токена — не смена человека")
+        XCTAssertFalse(logoutPending)
+    }
+
+    /// Ответ регистрации, ушедшей со старым токеном того же человека, не кэшируется — и его
+    /// статус тоже не публикуется: `stale` устаревшего токена хост принял бы за провал свежего.
+    func testСтатусРегистрацииСоСтарымТокеномНеПубликуется() async throws {
+        stubRegister(jwt: "jwt-first", identityStatus: "stale", unlinked: true, delay: 0.3)
+        stubRegister(jwt: "jwt-fresh", identityStatus: "verified")
+        let client = makeClient()
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-42", iat: 1))
+
+        async let token = client.validToken()
+        try await waitForRegisters(1)
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-42", iat: 2))
+        _ = try await token
+
+        let afterSuperseded = await client.identityStatus
+        XCTAssertEqual(afterSuperseded, .notProvided, "статус старого токена не публикуется")
+        _ = try await client.validToken()
+        let afterFresh = await client.identityStatus
+        XCTAssertEqual(afterFresh, .verified)
+    }
+
+    /// `sub` не читается — сервер такой токен отклонит и связь не тронет. Без флага устройство
+    /// осталось бы за прежним, и новый человек читал бы его тред.
+    func testТокенБезSubПоверхПрежнегоСтавитВыход() async throws {
+        stubRegister(identityStatus: "verified", unlinked: true)
+        let client = makeClient()
+        await client.setIdentityToken(makeIdentityJWT(sub: "user-a"))
+        _ = try await client.openSession()
+        XCTAssertFalse(logoutPending, "выход первого токена подтверждён")
+
+        await client.setIdentityToken("not-a-jwt")
+
+        XCTAssertTrue(logoutPending)
     }
 
     /// Другой `sub` поверх прежнего без выхода: связь прежнего рвётся, даже если токен
@@ -346,7 +382,7 @@ final class APIClientTests: XCTestCase {
         stubRegister(identityStatus: "stale", unlinked: true)
         let client = makeClient()
         await client.setIdentityToken(makeIdentityJWT(sub: "user-a"))
-        XCTAssertFalse(logoutPending, "первый вход — рвать нечего")
+        XCTAssertTrue(logoutPending, "первый токен экземпляра: кто был связан до него, неизвестно")
         await client.setConversationId(77)
 
         await client.setIdentityToken(makeIdentityJWT(sub: "user-b"))

@@ -195,8 +195,12 @@ final class ChatControllerCatchUpTests: XCTestCase {
 
         try await waitUntil("баннера об ошибке сессии") { controller.store.connectionError != nil }
         XCTAssertEqual(controller.store.connectionError, "Сессия недействительна. Откройте чат заново.")
-        // Даём долететь уже отправленному, затем проверяем несколько периодов тишины.
-        try await Task.sleep(nanoseconds: 150_000_000)
+        // Ждём, пока транспорт ответит на всё, что уже ушло, — по счётчикам стенда, а не по
+        // времени. Затем проверяем несколько периодов тишины.
+        try await waitUntil("ответов на всё отправленное") {
+            StubURLProtocol.completed(path: self.registerPath) == StubURLProtocol.requests(path: self.registerPath).count
+                && StubURLProtocol.completed(path: self.messagesPath) == StubURLProtocol.requests(path: self.messagesPath).count
+        }
         let registers = StubURLProtocol.requests(path: registerPath).count
         let histories = StubURLProtocol.requests(path: messagesPath).count
         try await Task.sleep(nanoseconds: 300_000_000)

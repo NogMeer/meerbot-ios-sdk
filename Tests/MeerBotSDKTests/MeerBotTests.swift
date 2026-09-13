@@ -119,13 +119,43 @@ final class MeerBotTests: XCTestCase {
         XCTAssertNil(sdk.client)
     }
 
+    /// Сброс отменяет только ПОСЛЕДНЮЮ задачу очереди; остальные ждут предыдущую и об отмене
+    /// не знают. Без сверки ревизии они применили бы вход и выход к прежнему клиенту и снова
+    /// записали флаг, который сброс только что стёр.
+    func testResetПобеждаетНесколькоВызововВОчереди() async throws {
+        let sdk = makeSDK()
+        sdk.identify(token: makeIdentityJWT(sub: "user-a"))
+        let first = try XCTUnwrap(sdk.identityTask)
+        sdk.identify(token: nil)
+        let second = try XCTUnwrap(sdk.identityTask)
+        sdk.identify(token: makeIdentityJWT(sub: "user-b"))
+        let third = try XCTUnwrap(sdk.identityTask)
+
+        sdk.reset()
+        await first.value
+        await second.value
+        await third.value
+
+        XCTAssertNil(defaults.string(forKey: IdentityFlagStore.pendingLogoutKey))
+        XCTAssertNil(defaults.string(forKey: AppliedIdentityStore.key))
+    }
+
     // MARK: Смена пользователя
+
+    /// Подтвердить выход, стоящий после первого входа, — чтобы следующий шаг теста проверял
+    /// СВОЙ флаг, а не оставшийся от входа.
+    private func confirmPendingLogout(_ sdk: MeerBot) async throws {
+        stubRegister(unlinked: true)
+        _ = try await register(sdk)
+        XCTAssertFalse(logoutPending)
+        StubURLProtocol.reset()
+    }
 
     func testДругойПользовательБезВыходаСтавитВыходИЧиститЛентуСразу() async throws {
         let sdk = makeSDK()
         sdk.identify(token: makeIdentityJWT(sub: "user-a"))
         await sdk.identityTask?.value
-        XCTAssertFalse(logoutPending, "первый вход — рвать нечего")
+        try await confirmPendingLogout(sdk)
         let store = try XCTUnwrap(sdk.chatController()).store
         store.appendUserMessage("переписка user-a")
 
@@ -147,6 +177,7 @@ final class MeerBotTests: XCTestCase {
         let sdk = makeSDK()
         sdk.identify(token: makeIdentityJWT(sub: "user-a", iat: 1))
         await sdk.identityTask?.value
+        try await confirmPendingLogout(sdk)
         let store = try XCTUnwrap(sdk.chatController()).store
         store.appendUserMessage("моё сообщение")
 
@@ -171,6 +202,9 @@ final class MeerBotTests: XCTestCase {
         await firstRun.identityTask?.value
         let stored = try XCTUnwrap(defaults.string(forKey: AppliedIdentityStore.key))
         XCTAssertFalse(stored.contains("user-42"), "id пользователя не лежит открытым текстом")
+        // Выход первого входа не подтверждён (регистрации не было) и переживает перезапуск.
+        let firstRunFlag = defaults.string(forKey: IdentityFlagStore.pendingLogoutKey)
+        XCTAssertNotNil(firstRunFlag)
 
         let secondRun = makeSDK()
         let store = try XCTUnwrap(secondRun.chatController()).store
@@ -179,11 +213,81 @@ final class MeerBotTests: XCTestCase {
         await secondRun.identityTask?.value
 
         XCTAssertEqual(store.messages.map(\.content), ["лента с прошлого запуска"])
-        XCTAssertFalse(logoutPending)
+        XCTAssertEqual(
+            defaults.string(forKey: IdentityFlagStore.pendingLogoutKey),
+            firstRunFlag,
+            "тот же человек нового выхода не пишет"
+        )
 
         secondRun.identify(token: makeIdentityJWT(sub: "user-7"))
         XCTAssertTrue(store.messages.isEmpty, "другой человек после перезапуска — смена")
+        XCTAssertNotEqual(defaults.string(forKey: IdentityFlagStore.pendingLogoutKey), firstRunFlag)
+    }
+
+    // MARK: Отвязка без известного прежнего
+
+    /// Установка связана ещё SDK 0.2.8 (хэш он не писал), первым после обновления входит
+    /// другой человек, и его токен сервер отклоняет. Без флага связь прежнего осталась бы, и
+    /// новый читал бы его тред.
+    func testПервыйВходБезСохранённогоХэшаСтавитВыход() async throws {
+        let sdk = makeSDK()
+        sdk.identify(token: makeIdentityJWT(sub: "user-b"))
+        XCTAssertTrue(logoutPending, "флаг на диске до всякого await")
+        await sdk.identityTask?.value
+        stubRegister(identityStatus: "rejected", unlinked: true)
+
+        let body = try await register(sdk)
+
+        XCTAssertEqual(body["logout"] as? Bool, true)
+        XCTAssertEqual(body["identityToken"] as? String, makeIdentityJWT(sub: "user-b"))
+    }
+
+    /// `sub` не читается: сервер токен отклонит и связь прежнего не тронет — рвёт её флаг.
+    /// Повтор того же токена — не смена (ключ — сам токен).
+    func testТокенБезSubПоверхПрежнегоОтвязываетЕго() async throws {
+        let sdk = makeSDK()
+        sdk.identify(token: makeIdentityJWT(sub: "user-a"))
+        await sdk.identityTask?.value
+        try await confirmPendingLogout(sdk)
+        let store = try XCTUnwrap(sdk.chatController()).store
+        store.appendUserMessage("переписка user-a")
+
+        sdk.identify(token: "not-a-jwt")
+
+        XCTAssertTrue(store.messages.isEmpty)
         XCTAssertTrue(logoutPending)
+        await sdk.identityTask?.value
+        stubRegister(identityStatus: "rejected", unlinked: true)
+        let body = try await register(sdk)
+        XCTAssertEqual(body["logout"] as? Bool, true)
+        XCTAssertFalse(logoutPending)
+
+        store.appendUserMessage("анонимно")
+        sdk.identify(token: "not-a-jwt")
+        await sdk.identityTask?.value
+        XCTAssertFalse(logoutPending, "тот же токен — не смена")
+        XCTAssertEqual(store.messages.map(\.content), ["анонимно"])
+    }
+
+    // MARK: Черновик
+
+    /// Встроенный чат не закрывается между выходом A и входом B: поле ввода (оно читает
+    /// `ChatStore.draft`) не должно показать B текст, набранный A.
+    func testВыходИСменаПользователяСтираютЧерновик() async throws {
+        let sdk = makeSDK()
+        sdk.identify(token: makeIdentityJWT(sub: "user-a"))
+        await sdk.identityTask?.value
+        let store = try XCTUnwrap(sdk.chatController()).store
+        let field = ChatInput.draftBinding(for: store)
+
+        field.wrappedValue = "черновик user-a"
+        sdk.identify(token: nil)
+        XCTAssertEqual(field.wrappedValue, "", "выход стирает черновик сразу")
+
+        field.wrappedValue = "черновик анонима"
+        sdk.identify(token: makeIdentityJWT(sub: "user-b"))
+        XCTAssertEqual(field.wrappedValue, "", "вход другого человека стирает черновик сразу")
+        await sdk.identityTask?.value
     }
 
     /// Выход забывает, кто был: вход того же человека после выхода — новая связь.

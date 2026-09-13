@@ -192,6 +192,59 @@ final class ChatStoreMergeTests: XCTestCase {
         )
     }
 
+    /// Курсора на момент отправки не было (история ещё не пришла). Вчерашнее «да» с ответом
+    /// эхом сегодняшнего не становится: иначе строка получила бы чужой id, вчерашняя пропала
+    /// бы из ленты, а сверка после обрыва сочла бы недошедшее сообщение доставленным.
+    func testВчерашнийТотЖеТекстНеЭхо() {
+        let store = ChatStore()
+        let local = store.appendUserMessage("да")
+
+        store.mergeServerMessages([
+            olderServerMessage(5, role: "user", text: "да"),
+            olderServerMessage(6, text: "Записал"),
+        ])
+
+        XCTAssertEqual(store.messages.map(\.content), ["да", "Записал", "да"])
+        XCTAssertEqual(store.messages.last?.id, local.id)
+        XCTAssertNil(store.messages.last?.serverId)
+    }
+
+    /// Курсор на момент отправки известен — эхо обязано быть новее него, даже если по времени
+    /// строка подходит (часы устройства и сервера расходятся).
+    func testСтрокаНеНовееКурсораНаМоментОтправкиНеЭхо() {
+        let store = ChatStore()
+        store.mergeServerMessages([serverMessage(7, text: "последнее известное")])
+        let local = store.appendUserMessage("да")
+
+        store.mergeServerMessages([serverMessage(5, role: "user", text: "да")])
+        XCTAssertNil(store.messages.first { $0.id == local.id }?.serverId, "строка 5 существовала до отправки")
+
+        store.mergeServerMessages([serverMessage(9, role: "user", text: "да")])
+        XCTAssertEqual(store.messages.first { $0.id == local.id }?.serverId, 9)
+    }
+
+    /// Расхождение часов в пределах допуска эху не мешает.
+    func testЭхоСЧасамиСервераЧутьПозадиУзнаётся() {
+        let store = ChatStore()
+        let local = store.appendUserMessage("привет")
+
+        store.mergeServerMessages([
+            ChatMessage(serverId: 3, role: "user", content: "привет", timestamp: Date().addingTimeInterval(-120)),
+        ])
+
+        XCTAssertEqual(store.messages.map(\.id), [local.id])
+        XCTAssertEqual(store.messages.first?.serverId, 3)
+    }
+
+    func testСбросIdentityСтираетЧерновик() {
+        let store = ChatStore()
+        store.setDraft("не отправлено")
+
+        store.resetForIdentityChange()
+
+        XCTAssertEqual(store.draft, "")
+    }
+
     func testСбросIdentityСтираетНеподтверждённыеСообщения() {
         let store = ChatStore()
         store.mergeServerMessages([serverMessage(1, text: "a")])

@@ -179,26 +179,11 @@ struct MessagesList: View {
 
     private func list(proxy: ScrollViewProxy) -> some View {
         ScrollView {
-            LazyVStack(spacing: 0) {
-                if store.messages.isEmpty {
-                    VStack(spacing: 12) {
-                        Image(systemName: "bubble.left.and.bubble.right")
-                            .font(.system(size: 40))
-                            .foregroundColor(.secondary)
-                        Text(store.greeting ?? "Привет! Чем могу помочь?")
-                            .multilineTextAlignment(.center)
-                            .foregroundColor(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 24)
-                    .padding(.top, 40)
-                } else {
-                    ForEach(store.messages) { msg in
-                        MessageBubbleView(message: msg)
-                            .id(msg.id)
-                    }
-                }
-            }
+            // `.equatable()` — из-за черновика. Поле ввода привязано к `ChatStore.draft`, и
+            // каждая буква публикует изменение всего стора: этот вью перестраивается. Сама
+            // лента при этом не пересобирается — массив тот же, и сравнение отвечает сразу.
+            MessagesFeed(messages: store.messages, greeting: store.greeting)
+                .equatable()
         }
         // Открытие экрана. Одного `onChange` мало: `ChatStore` живёт в синглтоне
         // `MeerBot.shared` и переживает закрытие чата, поэтому при ПОВТОРНОМ открытии
@@ -262,6 +247,36 @@ struct MessagesList: View {
     }
 }
 
+/// Содержимое ленты — отдельно от прокрутки, чтобы его можно было сравнить и не
+/// пересобирать (см. `MessagesList.list`).
+struct MessagesFeed: View, Equatable {
+    let messages: [ChatMessage]
+    let greeting: String?
+
+    var body: some View {
+        LazyVStack(spacing: 0) {
+            if messages.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 40))
+                        .foregroundColor(.secondary)
+                    Text(greeting ?? "Привет! Чем могу помочь?")
+                        .multilineTextAlignment(.center)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
+                .padding(.top, 40)
+            } else {
+                ForEach(messages) { msg in
+                    MessageBubbleView(message: msg)
+                        .id(msg.id)
+                }
+            }
+        }
+    }
+}
+
 struct TypingIndicator: View {
     @State private var bounce = false
 
@@ -290,19 +305,29 @@ struct ChatInput: View {
     @FocusState.Binding var isFocused: Bool
     let onSend: (String) -> Void
 
-    @State private var localDraft: String = ""
+    /// Текст поля живёт в `ChatStore.draft`, а не в `@State` этого вью.
+    ///
+    /// Раньше здесь был свой `@State`, и `ChatStore.draft` не читал никто: смена identity
+    /// чистила черновик стора, а поле — нет. Во встроенном чате (вкладка хоста, экран не
+    /// закрывается) набранный, но не отправленный текст прежнего пользователя оставался в
+    /// поле следующего, и тот мог отправить его в свой тред.
+    static func draftBinding(for store: ChatStore) -> Binding<String> {
+        Binding(get: { store.draft }, set: { store.setDraft($0) })
+    }
+
+    private var draft: Binding<String> { Self.draftBinding(for: store) }
 
     private var trimmed: String {
-        localDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        store.draft.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     @ViewBuilder
     private var textField: some View {
         if #available(iOS 16.0, macOS 13.0, *) {
-            TextField("Сообщение…", text: $localDraft, axis: .vertical)
+            TextField("Сообщение…", text: draft, axis: .vertical)
                 .lineLimit(1...4)
         } else {
-            TextField("Сообщение…", text: $localDraft)
+            TextField("Сообщение…", text: draft)
         }
     }
 
@@ -320,7 +345,7 @@ struct ChatInput: View {
             Button(action: {
                 guard !trimmed.isEmpty, !store.sending, store.mode != .closed else { return }
                 let text = trimmed
-                localDraft = ""
+                store.clearDraft()
                 onSend(text)
             }) {
                 Image(systemName: "paperplane.fill")

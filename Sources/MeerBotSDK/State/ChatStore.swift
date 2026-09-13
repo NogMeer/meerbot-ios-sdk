@@ -66,6 +66,21 @@ public final class ChatStore: ObservableObject {
     /// Наибольший серверный id в ленте — курсор догона (`GET /mobile/messages?since=`).
     @Published public private(set) var lastServerMessageId: Int = 0
 
+    /// Курсор на момент появления локальной строки: её эхо на сервере обязано быть НОВЕЕ.
+    ///
+    /// Слияние узнаёт эхо по тексту, а текст повторяется («да», «ок»). Без этой границы
+    /// вчерашнее «да» из стартовой истории забирало сегодняшнее неотправленное: строка
+    /// получала чужой серверный id, вчерашняя пропадала из ленты, а сверка после обрыва
+    /// видела «эхо и ответ после него» и объявляла недошедшее сообщение доставленным —
+    /// без «Повторить». Всё, что на сервере не старше курсора, существовало до отправки.
+    ///
+    /// Не в `ChatMessage`: граница — знание этого экземпляра ленты, а не свойство сообщения,
+    /// и публичная модель (с её `Equatable`) от неё меняться не должна.
+    private var echoFloors: [String: Int] = [:]
+    /// Расхождение часов устройства и сервера, которое терпит сверка по времени (когда
+    /// курсора на момент отправки не было — история ещё не пришла).
+    static let echoClockTolerance: TimeInterval = 5 * 60
+
     public init() {}
 
     public func setDraft(_ text: String) { draft = text }
@@ -89,14 +104,16 @@ public final class ChatStore: ObservableObject {
 
     @discardableResult
     public func appendUserMessage(_ content: String) -> ChatMessage {
-        let msg = ChatMessage(role: "user", content: content)
-        messages.append(msg)
-        return msg
+        appendLocal(ChatMessage(role: "user", content: content))
     }
 
     @discardableResult
     public func appendAssistantPlaceholder() -> ChatMessage {
-        let msg = ChatMessage(role: "assistant", author: "ai", content: "", streaming: true)
+        appendLocal(ChatMessage(role: "assistant", author: "ai", content: "", streaming: true))
+    }
+
+    private func appendLocal(_ msg: ChatMessage) -> ChatMessage {
+        echoFloors[msg.id] = lastServerMessageId
         messages.append(msg)
         return msg
     }
@@ -126,7 +143,7 @@ public final class ChatStore: ObservableObject {
     }
 
     public func appendOperatorMessage(content: String, authorName: String?) {
-        messages.append(
+        _ = appendLocal(
             ChatMessage(
                 role: "assistant",
                 author: "manager",
@@ -144,6 +161,7 @@ public final class ChatStore: ObservableObject {
 
     public func removeMessage(id: String) {
         messages.removeAll { $0.id == id }
+        echoFloors[id] = nil
     }
 
     /// Заменить всю ленту.
@@ -153,6 +171,7 @@ public final class ChatStore: ObservableObject {
     /// пришедший после отправки, убирал бы отправленное сообщение с экрана.
     public func replaceAll(_ items: [ChatMessage]) {
         messages = items
+        echoFloors.removeAll()
         bumpCursor(items)
     }
 
@@ -165,9 +184,11 @@ public final class ChatStore: ObservableObject {
     ///   1. `serverId` уже в ленте — пропускаем (страница пришла повторно, это норма догона);
     ///   2. есть локальный двойник (тот же `role` и текст, ещё без серверного id) — ПРОМОУТИМ
     ///      его, а не добавляем второй: иначе своё же сообщение пользователь увидит дважды.
-    ///      Идём от новых к старым, чтобы эхо забрала самая новая строка с этим текстом, а не
-    ///      вчерашнее «ок» из полной истории. Стримящийся пузырь не промоутим: он ещё
-    ///      дописывается, и серверная строка с тем же текстом — не его окончательная версия.
+    ///      Двойником может быть только строка, которая на сервере НОВЕЕ локальной
+    ///      (`canBeEcho`): вчерашнее «ок» из полной истории эхом сегодняшнего не бывает.
+    ///      Идём от новых к старым, чтобы из подходящих эхо забрала самая новая. Стримящийся
+    ///      пузырь не промоутим: он ещё дописывается, и серверная строка с тем же текстом —
+    ///      не его окончательная версия.
     ///
     /// Проход 2, по порядку страницы — вставить остальное на своё место (см. `insertionIndex`),
     /// а не в конец: стартовая история, пришедшая после отправки, старше отправленного
@@ -192,9 +213,11 @@ public final class ChatStore: ObservableObject {
             if let localIdx = messages.lastIndex(where: {
                 $0.serverId == nil && !$0.streaming && $0.role == item.role
                     && $0.content.trimmingCharacters(in: .whitespacesAndNewlines) == itemKey
+                    && canBeEcho(item, of: $0)
             }) {
                 messages[localIdx].serverId = item.serverId
                 messages[localIdx].failed = false
+                echoFloors[messages[localIdx].id] = nil
                 recognized.insert(index)
             }
         }
@@ -208,6 +231,24 @@ public final class ChatStore: ObservableObject {
         }
         bumpCursor(items)
         return added
+    }
+
+    /// Может ли серверная строка быть эхом локальной.
+    ///
+    /// Курсор на момент появления локальной строки известен — эхо обязано быть новее него:
+    /// серверный id растёт, и это сравнение точное. Курсора не было (история ещё не пришла,
+    /// тред пуст) — остаётся время: серверная строка не старше локальной больше, чем на
+    /// `echoClockTolerance`. Старые строки, чей текст совпал, эхом не считаются никогда.
+    ///
+    /// Строка, добавленная в ленту не через `append*` (например, хостом через `replaceAll`),
+    /// курсора не имеет и сверяется по времени.
+    private func canBeEcho(_ item: ChatMessage, of local: ChatMessage) -> Bool {
+        let floor = echoFloors[local.id] ?? 0
+        if floor > 0 {
+            guard let sid = item.serverId else { return false }
+            return sid > floor
+        }
+        return item.timestamp >= local.timestamp.addingTimeInterval(-Self.echoClockTolerance)
     }
 
     /// Место новой серверной строки — сразу после последней строки ленты, которая раньше неё.
@@ -236,7 +277,10 @@ public final class ChatStore: ObservableObject {
     /// Убрать пустой стриминговый плейсхолдер (ответ так и не начался).
     public func dropEmptyPlaceholder(id: String) {
         guard let idx = messages.firstIndex(where: { $0.id == id }) else { return }
-        if messages[idx].content.isEmpty { messages.remove(at: idx) }
+        if messages[idx].content.isEmpty {
+            messages.remove(at: idx)
+            echoFloors[id] = nil
+        }
     }
 
     public func resetForLogout() {
@@ -247,8 +291,13 @@ public final class ChatStore: ObservableObject {
     /// Сменился пользователь (выход или другой вход): лента, режим, черновик и курсор
     /// прежнего человека не должны пережить смену. Приветствие остаётся — его задаёт хост,
     /// и к пользователю оно не относится.
+    ///
+    /// Черновик — это текст в поле ввода `ChatView` (оно привязано к `draft`): набранное,
+    /// но не отправленное прежним человеком следующий иначе увидел бы и мог отправить в
+    /// свой тред.
     func resetForIdentityChange() {
         messages.removeAll()
+        echoFloors.removeAll()
         mode = .ai
         operatorTyping = nil
         draft = ""

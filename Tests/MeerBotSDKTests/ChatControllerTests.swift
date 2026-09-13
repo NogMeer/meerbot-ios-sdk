@@ -213,9 +213,11 @@ final class ChatControllerTests: XCTestCase {
         dropped.failure = URLError(.networkConnectionLost)
         dropped.chunkDelay = 0.05
         StubURLProtocol.enqueue(path: streamPath, dropped)
+        // Эхо записано в момент отправки: строка из прошлого эхом быть не может (см. тест про
+        // вчерашний текст ниже).
         stubHistory([
-            ["id": 1, "role": "user", "content": "привет", "createdAt": "2026-08-15T10:00:00.000Z"],
-            ["id": 2, "role": "assistant", "content": "Ответ дописан", "createdAt": "2026-08-15T10:00:01.000Z"],
+            ["id": 1, "role": "user", "content": "привет", "createdAt": now()],
+            ["id": 2, "role": "assistant", "content": "Ответ дописан", "createdAt": now()],
         ])
 
         let controller = makeController()
@@ -752,5 +754,166 @@ final class ChatControllerTests: XCTestCase {
         let clientConversationId = await client.conversationId
         XCTAssertNil(clientConversationId)
         XCTAssertTrue(StubURLProtocol.requests(path: messagesPath).isEmpty)
+    }
+
+    // MARK: - Черновик прежнего пользователя
+
+    /// Встроенный чат (вкладка хоста) не закрывается: A набрал текст, не отправил, вышел,
+    /// вошёл B. Поле держало свой `@State`, и текст A оставался в поле B.
+    func testСменаIdentityСтираетТекстВПолеВвода() {
+        let controller = makeController()
+        let field = ChatInput.draftBinding(for: controller.store)
+        field.wrappedValue = "мой номер договора 123"
+        XCTAssertEqual(controller.store.draft, "мой номер договора 123", "поле пишет в стор")
+
+        controller.beginIdentityChange()
+
+        XCTAssertEqual(field.wrappedValue, "", "поле читает стор — текст прежнего стёрт")
+        controller.finishIdentityChange()
+    }
+
+    /// Вторая смена identity, пока сообщение ждёт первую: текст набран человеком, чья лента
+    /// стирается. В ленте следующего он не остаётся ни отправленным, ни с «Повторить».
+    func testВтораяСменаIdentityОтбрасываетЖдущееСообщениеПрежнего() {
+        let controller = makeController()
+
+        controller.beginIdentityChange()
+        controller.send("привет")
+        XCTAssertTrue(controller.store.sending)
+        controller.beginIdentityChange()
+        controller.finishIdentityChange()
+        controller.finishIdentityChange()
+
+        // Не отброшенное сообщение ушло бы здесь же синхронно: `run` ставит `sending` и пузырь.
+        XCTAssertTrue(controller.store.messages.isEmpty)
+        XCTAssertFalse(controller.store.sending)
+        XCTAssertNil(controller.retryableText)
+    }
+
+    // MARK: - Повтор не дублирует доставленное
+
+    /// Обрыв после того, как сервер записал сообщение, но до ответа: эхо в истории есть,
+    /// ответа нет. Раньше сообщение помечалось недоставленным, и «Повторить» отправлял его
+    /// второй раз — дубль в треде и второй платный ответ модели.
+    func testЭхоБезОтветаПослеОбрываНеПредлагаетПовтор() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse("event: meta\ndata: {\"conversationId\":31,\"mode\":\"ai\"}\n\n")
+        dropped.failure = URLError(.networkConnectionLost)
+        dropped.chunkDelay = 0.05
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+        stubHistory([["id": 1, "role": "user", "content": "привет", "createdAt": now()]])
+
+        let controller = makeController()
+        controller.send("привет")
+
+        // Эхо и решение о пометке — в одном ходе главного актора, без `await` между ними.
+        try await waitUntil("эха сообщения") { controller.store.messages.first?.serverId == 1 }
+        XCTAssertEqual(controller.store.messages.first?.failed, false)
+        XCTAssertNil(controller.retryableText)
+        XCTAssertFalse(controller.store.sending)
+    }
+
+    /// Сообщение пометили недоставленным, а догон потом узнал его на сервере. Пометку слияние
+    /// снимало, «Повторить» — нет, и повтор уходил запасным `send(text)`.
+    func testСлияниеСнявшееПометкуУбираетПовторИПовторНеШлётДубль() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse("")
+        dropped.failure = URLError(.networkConnectionLost)
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+        stubHistory([
+            ["id": 1, "role": "user", "content": "привет", "createdAt": now()],
+            ["id": 2, "role": "assistant", "content": "Ответ", "createdAt": now()],
+        ])
+
+        let controller = makeController()
+        controller.send("привет")
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+
+        controller.start()
+        try await waitUntil("стартовой истории") { controller.isReady }
+
+        XCTAssertEqual(controller.store.messages.first?.failed, false)
+        XCTAssertNil(controller.retryableText, "«Повторить» ушёл вместе с пометкой")
+        controller.retry()
+        XCTAssertFalse(controller.store.sending, "повтор ничего не отправил")
+        XCTAssertEqual(StubURLProtocol.requests(path: streamPath).count, 1)
+        XCTAssertEqual(contents(controller), ["привет", "Ответ"])
+    }
+
+    /// Пользователь повторил вчерашний текст, сообщение не дошло. В истории — вчерашнее «да»
+    /// и ответ на него: раньше вчерашняя строка становилась эхом, ответ после неё — «доставкой»,
+    /// и сообщение пропадало без «Повторить».
+    func testВчерашнийТотЖеТекстНеСчитаетсяДоставкойПослеОбрыва() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse("event: meta\ndata: {\"conversationId\":31,\"mode\":\"ai\"}\n\n")
+        dropped.failure = URLError(.networkConnectionLost)
+        dropped.chunkDelay = 0.05
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+        stubHistory([
+            ["id": 5, "role": "user", "content": "да", "createdAt": now(offset: -86_400)],
+            ["id": 6, "role": "assistant", "content": "Записал", "createdAt": now(offset: -86_400)],
+        ])
+
+        let controller = makeController()
+        controller.send("да")
+        let local = try XCTUnwrap(controller.store.messages.first)
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(contents(controller), ["да", "Записал", "да"], "вчерашняя строка на месте")
+        XCTAssertEqual(controller.store.messages.last?.id, local.id)
+        XCTAssertNil(controller.store.messages.last?.serverId)
+        XCTAssertEqual(controller.store.messages.last?.failed, true)
+    }
+
+    // MARK: - Экран закрыли посреди отправки
+
+    /// Отмена потребителем заканчивает поток без ошибки. Раньше это шло веткой успеха:
+    /// регистрация ещё не ответила, запрос не ушёл, а сообщение осталось без пометки.
+    func testЗакрытиеЭкранаПокаИдётРегистрацияОставляетСообщениеНедоставленным() async throws {
+        let gate = StubGate()
+        var register = StubResponse.json([
+            "deviceId": "42", "jwt": "jwt-1", "expiresIn": 900, "identity": ["status": "not_provided"],
+        ])
+        register.gate = gate
+        StubURLProtocol.enqueue(path: registerPath, register)
+
+        let controller = makeController()
+        controller.send("привет")
+        try await waitUntil("регистрации в полёте") { StubURLProtocol.requests(path: self.registerPath).count == 1 }
+
+        controller.stop()
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(controller.retryableText, "привет")
+        XCTAssertEqual(contents(controller), ["привет"], "пузырь ответа убран")
+        XCTAssertEqual(controller.store.messages.first?.failed, true)
+        XCTAssertFalse(controller.store.sending)
+        XCTAssertNil(controller.store.connectionError, "ошибки связи не было")
+
+        gate.open()
+        try await waitUntil("ответа регистрации") { StubURLProtocol.completed(path: self.registerPath) == 1 }
+    }
+
+    /// Ответ уже стримился: обрывок окончательной версией не станет (сервер на разрыв
+    /// прерывает генерацию), и в ленте его не остаётся.
+    func testЗакрытиеЭкранаПосредиОтветаУбираетНедописанныйПузырь() async throws {
+        stubRegister()
+        var slow = StubResponse(chunks: [
+            Data("data: {\"choices\":[{\"delta\":{\"content\":\"частичный\"}}]}\n\n".utf8),
+            Data("data: [DONE]\n\n".utf8),
+        ])
+        slow.chunkDelay = 0.5
+        StubURLProtocol.enqueue(path: streamPath, slow)
+
+        let controller = makeController()
+        controller.send("привет")
+        try await waitUntil("начала ответа") { controller.store.messages.last?.content == "частичный" }
+
+        controller.stop()
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(contents(controller), ["привет"])
+        XCTAssertEqual(controller.store.messages.first?.failed, true)
+        try await waitUntil("конца ответа транспорта") { StubURLProtocol.completed(path: self.streamPath) == 1 }
     }
 }
