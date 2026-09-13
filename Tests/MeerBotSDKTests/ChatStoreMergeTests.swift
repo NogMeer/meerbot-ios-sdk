@@ -236,6 +236,197 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertEqual(store.messages.first?.serverId, 3)
     }
 
+    // MARK: - Сопоставление по `clientMessageId`
+
+    /// Точное сопоставление сильнее всех догадок: текст сервер подрезал/изменил (менеджер
+    /// правил), серверный id НИЖЕ курсора на момент отправки, а время строки на 10 минут
+    /// позади устройства — по тексту и часам такая строка эхом не считалась бы ни за что.
+    func testПромоутПоIdИгнорируетТекстКурсорИЧасы() {
+        let store = ChatStore()
+        store.mergeServerMessages([serverMessage(40, text: "последнее известное")])
+        store.noteClientIdsSupported()
+        let local = store.appendUserMessage("нужен счёт на оплату")
+
+        let added = store.mergeServerMessages(
+            [
+                ChatMessage(
+                    serverId: 12,
+                    role: "user",
+                    content: "другой текст",
+                    timestamp: Date().addingTimeInterval(-600)
+                ),
+            ],
+            clientIds: [12: local.id]
+        )
+
+        XCTAssertEqual(added, 0)
+        XCTAssertEqual(store.messages.count, 2)
+        XCTAssertEqual(store.messages.last?.id, local.id)
+        XCTAssertEqual(store.messages.last?.serverId, 12)
+        XCTAssertTrue(store.isIdConfirmed(local.id))
+    }
+
+    /// Сервер отдаёт id в нижнем регистре, локальный `UUID` — в верхнем: регистр не должен
+    /// решать, узнает экран своё сообщение или покажет его дважды.
+    func testПромоутПоIdНеЗависитОтРегистра() {
+        let store = ChatStore()
+        store.noteClientIdsSupported()
+        let local = store.appendUserMessage("привет")
+
+        let added = store.mergeServerMessages(
+            [serverMessage(3, role: "user", text: "привет")],
+            clientIds: [3: local.id.lowercased()]
+        )
+
+        XCTAssertEqual(added, 0)
+        XCTAssertEqual(store.messages.map(\.serverId), [3])
+    }
+
+    /// Два одинаковых «да» подряд: по тексту их не различить, по id — точно. Перепутанные
+    /// местами, они дали бы неверную сверку «на это ответили, на то нет».
+    func testДваОдинаковыхДаРазводятсяПоId() {
+        let store = ChatStore()
+        store.noteClientIdsSupported()
+        let first = store.appendUserMessage("да")
+        let second = store.appendUserMessage("да")
+
+        let added = store.mergeServerMessages(
+            [
+                serverMessage(21, role: "user", text: "да"),
+                serverMessage(22, role: "user", text: "да"),
+            ],
+            clientIds: [21: first.id, 22: second.id]
+        )
+
+        XCTAssertEqual(added, 0)
+        XCTAssertEqual(store.messages.map(\.id), [first.id, second.id])
+        XCTAssertEqual(store.messages.map(\.serverId), [21, 22])
+    }
+
+    /// У строки есть ЧУЖОЙ `clientMessageId` (другое устройство того же человека): локального
+    /// двойника нет, и по тексту её сопоставлять нельзя — иначе своё сообщение получило бы
+    /// чужой id, а сверка после обрыва сочла бы его доставленным.
+    func testЧужойIdПоТекстуНеСопоставляется() {
+        let store = ChatStore()
+        store.noteClientIdsSupported()
+        let local = store.appendUserMessage("да")
+
+        let added = store.mergeServerMessages(
+            [serverMessage(31, role: "user", text: "да")],
+            clientIds: [31: UUID().uuidString.lowercased()]
+        )
+
+        XCTAssertEqual(added, 1)
+        // Чужая строка встала рядом, своя осталась неподтверждённой — и это правильно: сверка
+        // после обрыва увидит, что сообщение до сервера не дошло.
+        XCTAssertEqual(store.messages.map(\.serverId), [nil, 31])
+        XCTAssertEqual(store.messages.first?.id, local.id)
+        XCTAssertFalse(store.isIdConfirmed(local.id))
+    }
+
+    /// Сервер умеет идентификаторы, а у строки пользователя его нет (записана до 0.2.9 или
+    /// другим клиентом) — своей она быть не может: всё, что ушло с этого экрана, несло id.
+    func testБезIdПриПоддержкеСерверомСтрокаПользователяНеЭхо() {
+        let store = ChatStore()
+        store.noteClientIdsSupported()
+        let local = store.appendUserMessage("привет")
+
+        let added = store.mergeServerMessages([serverMessage(9, role: "user", text: "привет")], clientIds: [:])
+
+        XCTAssertEqual(added, 1)
+        XCTAssertNil(store.messages.first { $0.id == local.id }?.serverId)
+    }
+
+    /// Строка сервера несёт ЧУЖОЙ идентификатор (другое устройство того же человека): по тексту
+    /// её сопоставлять нельзя — иначе экран отдал бы ей своё, ещё не дошедшее сообщение и снял
+    /// бы с него «Повторить».
+    func testСтрокаСЧужимIdПоТекстуНеСопоставляется() {
+        let store = ChatStore()
+        store.noteClientIdsSupported()
+        let local = store.appendUserMessage("привет")
+        store.setFailed(id: local.id, true)
+
+        let added = store.mergeServerMessages(
+            [serverMessage(9, role: "user", text: "привет")],
+            clientIds: [9: "11111111-2222-4333-8444-555555555555"]
+        )
+
+        XCTAssertEqual(added, 1, "чужая строка добавляется отдельной")
+        XCTAssertNil(store.messages.first { $0.id == local.id }?.serverId)
+        XCTAssertEqual(store.messages.first { $0.id == local.id }?.failed, true)
+        XCTAssertFalse(store.isIdConfirmed(local.id))
+    }
+
+    /// Ответ ассистента сопоставляется по тексту и при поддержке идентификаторов: своего id у
+    /// него нет и быть не может (его пишет сервер), а пузырь потока узнавать надо.
+    func testОтветАссистентаПриПоддержкеIdСопоставляетсяПоТексту() {
+        let store = ChatStore()
+        store.noteClientIdsSupported()
+        let placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(id: placeholder.id, delta: "Готово")
+        store.finalizeAssistant(id: placeholder.id)
+
+        XCTAssertEqual(store.mergeServerMessages([serverMessage(14, text: "Готово")], clientIds: [:]), 0)
+        XCTAssertEqual(store.messages.map(\.serverId), [14])
+    }
+
+    /// Старый сервер идентификаторов не присылает: сопоставление по тексту остаётся
+    /// единственным и работает как до 0.2.9.
+    func testСтарыйСерверСопоставляетПоТекстуКакПрежде() {
+        let store = ChatStore()
+        let local = store.appendUserMessage("не приходит письмо")
+
+        let added = store.mergeServerMessages(
+            [serverMessage(7, role: "user", text: "не приходит письмо")],
+            clientIds: [:]
+        )
+
+        XCTAssertEqual(added, 0)
+        XCTAssertEqual(store.messages.map(\.id), [local.id])
+        XCTAssertEqual(store.messages.first?.serverId, 7)
+        XCTAssertFalse(store.isIdConfirmed(local.id), "по тексту — догадка, а не подтверждение сервера")
+    }
+
+    /// «Записал» и «ответил» — разные вещи: пока за сообщением на сервере ничего нет, кнопка
+    /// «Повторить» остаётся (повтор идемпотентен). Ответ в той же странице её снимает.
+    func testПометкаНеОтправленоСнимаетсяТолькоКогдаЗаСообщениемЕстьОтвет() {
+        let store = ChatStore()
+        store.noteClientIdsSupported()
+        let local = store.appendUserMessage("нужен счёт")
+        store.setFailed(id: local.id, true)
+
+        store.mergeServerMessages([serverMessage(50, role: "user", text: "нужен счёт")], clientIds: [50: local.id])
+        XCTAssertTrue(store.messages.first { $0.id == local.id }?.failed == true, "ответа ещё нет")
+
+        store.mergeServerMessages([serverMessage(51, text: "секунду")], clientIds: [:])
+        XCTAssertFalse(store.messages.first { $0.id == local.id }?.failed == true)
+    }
+
+    /// Подтверждение из `meta` приходит до страницы истории: строка получает серверный id, но
+    /// курсор ленты не двигается — иначе догон пропустил бы всё, что лежит между.
+    func testПодтверждениеПоIdНеДвигаетКурсор() {
+        let store = ChatStore()
+        let local = store.appendUserMessage("привет")
+
+        store.confirmUserMessage(localId: local.id, serverId: 77)
+
+        XCTAssertEqual(store.messages.first?.serverId, 77)
+        XCTAssertEqual(store.lastServerMessageId, 0)
+        XCTAssertTrue(store.isIdConfirmed(local.id))
+    }
+
+    /// Сброс ленты обязан забыть и подтверждения: иначе после смены устройства строка с
+    /// прежним серверным id считалась бы принятой новым устройством.
+    func testСбросыЧистятПодтверждения() {
+        let store = ChatStore()
+        let local = store.appendUserMessage("привет")
+        store.confirmUserMessage(localId: local.id, serverId: 5)
+
+        store.resetForIdentityChange()
+
+        XCTAssertFalse(store.isIdConfirmed(local.id))
+    }
+
     func testСбросIdentityСтираетЧерновик() {
         let store = ChatStore()
         store.setDraft("не отправлено")

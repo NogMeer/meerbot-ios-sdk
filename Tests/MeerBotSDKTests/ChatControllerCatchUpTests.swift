@@ -131,7 +131,12 @@ final class ChatControllerCatchUpTests: XCTestCase {
         stubHistory([managerMessage(id: 9, text: "я тут")])
 
         try await waitUntil("первого появления") { controller.store.messages.count == 1 }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Ту же страницу догон обязан прочитать ещё дважды: ждём это по счётчику ответов
+        // стенда, а не паузой — пауза проверяла бы планировщик, а не дедупликацию.
+        let servedPages = StubURLProtocol.completed(path: messagesPath)
+        try await waitUntil("двух повторных страниц") {
+            StubURLProtocol.completed(path: self.messagesPath) >= servedPages + 2
+        }
 
         XCTAssertEqual(controller.store.messages.count, 1)
     }
@@ -139,9 +144,13 @@ final class ChatControllerCatchUpTests: XCTestCase {
     /// Оборванная сеть у того, кто просто смотрит переписку, — не повод красить экран.
     func testОшибкаФоновогоДогонаНеПоказываетсяПользователю() async throws {
         let controller = try await started()
+        let servedPages = StubURLProtocol.completed(path: messagesPath)
         StubURLProtocol.enqueue(path: messagesPath, .json(["error": "boom"], status: 500))
 
-        try await Task.sleep(nanoseconds: 250_000_000)
+        // Ворота здесь не нужны: отказ обязан долететь и повториться — ждём два ответа стенда.
+        try await waitUntil("двух неудачных догонов") {
+            StubURLProtocol.completed(path: self.messagesPath) >= servedPages + 2
+        }
 
         XCTAssertNil(controller.store.connectionError)
     }
@@ -155,12 +164,21 @@ final class ChatControllerCatchUpTests: XCTestCase {
     func testStopОстанавливаетДогон() async throws {
         let controller = try await started()
         stubHistory()
-        try await Task.sleep(nanoseconds: 150_000_000)
+        // Сначала убеждаемся по счётчику стенда, что догон действительно крутится: без этого
+        // тест «остановился» проходил бы и на никогда не запускавшемся опросе.
+        let servedPages = StubURLProtocol.completed(path: messagesPath)
+        try await waitUntil("работающего догона") {
+            StubURLProtocol.completed(path: self.messagesPath) >= servedPages + 2
+        }
 
         controller.stop()
+        try await waitUntil("ответов на всё отправленное") {
+            StubURLProtocol.completed(path: self.messagesPath)
+                == StubURLProtocol.requests(path: self.messagesPath).count
+        }
         try await Task.sleep(nanoseconds: 150_000_000)
         let afterStop = StubURLProtocol.requests(path: messagesPath).count
-        try await Task.sleep(nanoseconds: 250_000_000)
+        try await Task.sleep(nanoseconds: 250_000_000)  // ≈6 периодов опроса по 0.04 с
 
         XCTAssertEqual(StubURLProtocol.requests(path: messagesPath).count, afterStop)
     }
@@ -203,9 +221,10 @@ final class ChatControllerCatchUpTests: XCTestCase {
         }
         let registers = StubURLProtocol.requests(path: registerPath).count
         let histories = StubURLProtocol.requests(path: messagesPath).count
-        try await Task.sleep(nanoseconds: 300_000_000)
         controller.onEnterForeground()
-        try await Task.sleep(nanoseconds: 100_000_000)
+        // Тишина — отрицательный факт, ворот для него нет: даём несколько периодов опроса и
+        // сверяем счётчики стенда.
+        try await Task.sleep(nanoseconds: 250_000_000)  // ≈6 периодов опроса по 0.04 с
 
         XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, registers, "перерегистраций больше нет")
         XCTAssertEqual(StubURLProtocol.requests(path: messagesPath).count, histories, "догон остановлен")
@@ -224,10 +243,15 @@ final class ChatControllerCatchUpTests: XCTestCase {
     func testВозвратИзФонаПриЗакрытомЭкранеНичегоНеДелает() async throws {
         let controller = try await started()
         controller.stop()
+        try await waitUntil("ответов на всё отправленное") {
+            StubURLProtocol.completed(path: self.messagesPath)
+                == StubURLProtocol.requests(path: self.messagesPath).count
+        }
         let afterStop = StubURLProtocol.requests(path: messagesPath).count
 
         controller.onEnterForeground()
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Ворот нет: проверяется отсутствие запросов. Окно — несколько периодов опроса.
+        try await Task.sleep(nanoseconds: 250_000_000)  // ≈6 периодов опроса по 0.04 с
 
         XCTAssertEqual(StubURLProtocol.requests(path: messagesPath).count, afterStop)
     }

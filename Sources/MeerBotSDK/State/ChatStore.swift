@@ -5,7 +5,7 @@
 import Foundation
 import Combine
 
-public enum ChatMode: String, Codable {
+public enum ChatMode: String, Codable, Sendable {
     case ai
     case pendingEscalation = "pending_escalation"
     case human
@@ -250,7 +250,6 @@ public final class ChatStore: ObservableObject {
     @discardableResult
     func mergeServerMessages(_ items: [ChatMessage], clientIds: [Int: String]) -> Int {
         var recognized = Set<Int>()
-        var promoted: [String] = []
         for (index, item) in items.enumerated().reversed() {
             if let sid = item.serverId, messages.contains(where: { $0.serverId == sid }) {
                 recognized.insert(index)
@@ -266,7 +265,6 @@ public final class ChatStore: ObservableObject {
                     messages[localIdx].serverId = item.serverId
                     echoFloors[messages[localIdx].id] = nil
                     idConfirmed.insert(messages[localIdx].id)
-                    promoted.append(messages[localIdx].id)
                     recognized.insert(index)
                 }
                 // Идентификатор у строки есть, но локального двойника нет — это чужая строка
@@ -305,9 +303,11 @@ public final class ChatStore: ObservableObject {
         }
         bumpCursor(items)
         // Пометку «не отправлено» снимаем только теперь: до вставки остальных строк страницы
-        // не видно, есть ли за сообщением ответ.
-        for localId in promoted where isSettled(localId) {
-            setFailed(id: localId, false)
+        // не видно, есть ли за сообщением ответ. Перебираем ВСЕ подтверждённые сервером строки,
+        // а не только узнанные этой страницей: ответ на сообщение приходит СЛЕДУЮЩИМ догоном, и
+        // иначе «Повторить» осталось бы на доставленном сообщении до конца сессии.
+        for message in messages where message.failed && idConfirmed.contains(message.id) {
+            if isSettled(message.id) { setFailed(id: message.id, false) }
         }
         return added
     }

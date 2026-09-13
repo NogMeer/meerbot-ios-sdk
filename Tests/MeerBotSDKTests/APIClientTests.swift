@@ -760,6 +760,282 @@ final class APIClientTests: XCTestCase {
         XCTAssertNil(page.messages.first?.authorKind)
     }
 
+    // MARK: Идемпотентная отправка (`clientMessageId`)
+
+    private func collectInternal(
+        _ stream: AsyncThrowingStream<StreamEvent, Error>
+    ) async -> (events: [StreamEvent], error: Error?) {
+        var events: [StreamEvent] = []
+        do {
+            for try await event in stream { events.append(event) }
+            return (events, nil)
+        } catch {
+            return (events, error)
+        }
+    }
+
+    private let clientId = "a1b2c3d4-0000-4000-8000-000000000042"
+
+    func testIdУходитВТелеЗапросаИПодтверждениеПриходитОтдельнымСобытием() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: streamPath,
+            .sse(
+                "event: meta\ndata: {\"conversationId\":5,\"mode\":\"ai\",\"clientMessageId\":\"\(clientId)\","
+                    + "\"userMessageId\":301,\"replayed\":false}\n\ndata: [DONE]\n\n"
+            )
+        )
+
+        let client = makeClient()
+        let (events, error) = await collectInternal(client.sendMessage("вопрос", clientMessageId: clientId))
+
+        XCTAssertNil(error)
+        XCTAssertEqual(
+            events,
+            [
+                .event(.meta(conversationId: 5, mode: .ai)),
+                .accepted(StreamAcceptance(clientMessageId: clientId, userMessageId: 301, replayed: false)),
+                .event(.done),
+            ]
+        )
+        let request = try XCTUnwrap(StubURLProtocol.requests(path: streamPath).first)
+        XCTAssertEqual(request.body?["clientMessageId"] as? String, clientId)
+        XCTAssertEqual(request.body?["clientMessageId"] as? String, clientId.lowercased())
+    }
+
+    /// Публичная отправка идентификатора не несёт (у хоста своих локальных строк нет) — тело
+    /// остаётся прежним, как у 0.2.8.
+    func testПубличнаяОтправкаТелоНеМеняет() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(path: streamPath, .sse("data: [DONE]\n\n"))
+
+        _ = await collect(makeClient().sendMessage("вопрос"))
+
+        let request = try XCTUnwrap(StubURLProtocol.requests(path: streamPath).first)
+        XCTAssertNil(request.body?["clientMessageId"])
+    }
+
+    /// Перерегистрация по 401 обязана повторить ТОТ ЖЕ идентификатор: другой превратил бы
+    /// повтор в второе сообщение (и вторую платную генерацию).
+    func testПовторПо401НесётТотЖеId() async throws {
+        stubRegister(jwt: "jwt-old")
+        stubRegister(jwt: "jwt-new")
+        StubURLProtocol.enqueue(
+            path: streamPath,
+            .json([
+                "error": ["type": "authentication_error", "code": "jwt_expired", "message": "JWT expired"],
+            ], status: 401),
+            .sse("data: [DONE]\n\n")
+        )
+
+        let (_, error) = await collectInternal(makeClient().sendMessage("вопрос", clientMessageId: clientId))
+
+        XCTAssertNil(error)
+        let ids = StubURLProtocol.requests(path: streamPath).map { $0.body?["clientMessageId"] as? String }
+        XCTAssertEqual(ids, [clientId, clientId])
+    }
+
+    /// Поддержка определяется НАЛИЧИЕМ ключа, а не значением: у строки, записанной до 0.2.9,
+    /// он приходит как `null` — и это всё равно «сервер умеет».
+    func testИсторияЧитаетIdИОпределяетПоддержкуПоНаличиюКлюча() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "messages": [
+                    ["id": 10, "role": "user", "content": "привет", "clientMessageId": NSNull()],
+                    ["id": 11, "role": "user", "content": "и ещё", "clientMessageId": clientId],
+                    ["id": 12, "role": "assistant", "content": "Здравствуйте!"],
+                ],
+                "hasMore": false,
+                "mode": "ai",
+            ])
+        )
+
+        let page = try await makeClient().history()
+
+        XCTAssertEqual(page.messages.map(\.clientMessageId), [nil, clientId, nil])
+        XCTAssertTrue(page.clientMessageIdsSupported)
+    }
+
+    /// Старый сервер ключа не отдаёт вовсе — экран остаётся на сопоставлении по тексту.
+    func testСтарыйСерверПоддержкуНеОбъявляет() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "messages": [["id": 10, "role": "user", "content": "привет"]],
+                "hasMore": false,
+                "mode": "ai",
+            ])
+        )
+
+        let page = try await makeClient().history()
+
+        XCTAssertNil(page.messages.first?.clientMessageId)
+        XCTAssertFalse(page.clientMessageIdsSupported)
+    }
+
+    /// Ключ только у строк пользователя: у ответа ассистента его нет и быть не может.
+    func testКлючУАссистентаПоддержкуНеОбъявляет() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "messages": [["id": 11, "role": "assistant", "content": "Ответ", "clientMessageId": NSNull()]],
+                "hasMore": false,
+                "mode": "ai",
+            ])
+        )
+
+        let page = try await makeClient().history()
+
+        XCTAssertFalse(page.clientMessageIdsSupported)
+    }
+
+    // MARK: Порядок смен identity (`identitySeq`)
+
+    func testНомерСменыIdentityУходитВРегистрацию() async throws {
+        stubRegister(unlinked: true)
+        let client = makeClient()
+
+        await client.logout()
+        _ = try await client.openSession()
+
+        let body = try XCTUnwrap(registerBodies().first)
+        XCTAssertEqual(body["identitySeq"] as? Int, 1, "выход поднял счётчик в той же критической секции")
+    }
+
+    func testБезСменIdentityНомерНуль() async throws {
+        stubRegister()
+        _ = try await makeClient().openSession()
+
+        XCTAssertEqual(registerBodies().first?["identitySeq"] as? Int, 0)
+    }
+
+    /// Счётчик отстал (настройки восстановили из бэкапа) — сервер называет свой номер, и это
+    /// значит, что для identity он запрос НЕ применил. Поднимаем счётчик и повторяем: иначе
+    /// выход так и висел бы неприменённым, а хост считал бы его доставленным.
+    func testСерверныйНомерБольшеПоднимаетСчётчикИРегистрацияПовторяется() async throws {
+        StubURLProtocol.enqueue(
+            path: registerPath,
+            .json([
+                "deviceId": "42",
+                "jwt": "jwt-discarded",
+                "expiresIn": 900,
+                "identity": ["status": "not_provided", "unlinked": true, "seq": 7],
+            ]),
+            .json([
+                "deviceId": "42",
+                "jwt": "jwt-applied",
+                "expiresIn": 900,
+                "identity": ["status": "not_provided", "unlinked": true, "seq": 7],
+            ])
+        )
+        let client = makeClient()
+        await client.logout()
+
+        let session = try await client.openSession()
+
+        XCTAssertEqual(session.jwt, "jwt-applied")
+        XCTAssertEqual(
+            registerBodies().map { $0["identitySeq"] as? Int },
+            [1, 7],
+            "второе тело уходит с номером, который сервер примет"
+        )
+        XCTAssertFalse(logoutPending, "выход подтверждён только принятым запросом")
+    }
+
+    /// Ответ отброшен — флаг выхода остаётся: сервер его не применил. Номер в каждом ответе
+    /// выше предыдущего, поэтому не проходит ни одна попытка.
+    func testОтброшенныйПоНомеруОтветНеСнимаетФлагВыхода() async throws {
+        for seq in [9, 11] {
+            StubURLProtocol.enqueue(
+                path: registerPath,
+                .json([
+                    "deviceId": "42",
+                    "jwt": "jwt-discarded",
+                    "expiresIn": 900,
+                    "identity": ["status": "not_provided", "unlinked": true, "seq": seq],
+                ])
+            )
+        }
+        let client = makeClient()
+        await client.logout()
+
+        do {
+            _ = try await client.openSession()
+            XCTFail("ожидалась отмена: ни одна попытка не применена")
+        } catch {
+            XCTAssertEqual((error as? MeerBotError)?.code, "cancelled")
+        }
+        XCTAssertTrue(logoutPending)
+    }
+
+    /// Старый сервер номера не присылает — поведение прежнее, повторов нет.
+    func testОтветБезНомераПовторовНеВызывает() async throws {
+        stubRegister(unlinked: true)
+        let client = makeClient()
+        await client.logout()
+
+        _ = try await client.openSession()
+
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 1)
+        XCTAssertFalse(logoutPending)
+    }
+
+    // MARK: Сервер занят (503)
+
+    /// 503 сервер отдаёт при перезапуске и сам называет паузу. `Retry-After: 0` — готов
+    /// сразу: тест детерминирован, потому что джиттер пропорционален паузе.
+    func testЗанятыйСерверПовторяетсяОдинРазПослеУказаннойПаузы() async throws {
+        var busy = StubResponse.json([
+            "error": ["type": "server_error", "code": "service_unavailable", "message": "restarting"],
+        ], status: 503)
+        busy.headers["Retry-After"] = "0"
+        StubURLProtocol.enqueue(path: registerPath, busy)
+        stubRegister(jwt: "jwt-after-restart")
+
+        let session = try await makeClient().openSession()
+
+        XCTAssertEqual(session.jwt, "jwt-after-restart")
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 2)
+    }
+
+    /// Второй отказ уходит наверх: дальше ждать — это держать пользователя на пустом экране.
+    func testВторойОтказЗанятогоСервераДоходитДоХоста() async {
+        var busy = StubResponse.json([
+            "error": ["type": "server_error", "code": "service_unavailable", "message": "restarting"],
+        ], status: 503)
+        busy.headers["Retry-After"] = "0"
+        StubURLProtocol.enqueue(path: registerPath, busy) // единственный ответ повторяется
+
+        do {
+            _ = try await makeClient().openSession()
+            XCTFail("ожидалась ошибка")
+        } catch {
+            XCTAssertEqual((error as? MeerBotError)?.code, "service_unavailable")
+        }
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 2, "ровно один повтор")
+    }
+
+    func testПаузаПередПовторомСчитаетсяПоЗаголовкуСПотолкомИДжиттером() {
+        // Заголовка нет — секунда: заметно меньше потолка и не попадает в тот же миг перезапуска.
+        XCTAssertEqual(APIClient.unavailableRetryDelay(retryAfter: nil, jitter: 0), 1, accuracy: 0.0001)
+        XCTAssertEqual(APIClient.unavailableRetryDelay(retryAfter: "not-a-number", jitter: 0), 1, accuracy: 0.0001)
+        // Потолок: дольше ждать молча нельзя.
+        XCTAssertEqual(
+            APIClient.unavailableRetryDelay(retryAfter: "600", jitter: 1),
+            APIClient.unavailableRetryCap * 1.1,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(APIClient.unavailableRetryDelay(retryAfter: "-5", jitter: 1), 0, accuracy: 0.0001)
+        // Джиттер пропорционален паузе: при `Retry-After: 0` ожидание не выдумывается.
+        XCTAssertEqual(APIClient.unavailableRetryDelay(retryAfter: "0", jitter: 1), 0, accuracy: 0.0001)
+        XCTAssertEqual(APIClient.unavailableRetryDelay(retryAfter: " 2 ", jitter: 0.5), 2.1, accuracy: 0.0001)
+        XCTAssertEqual(APIClient.unavailableRetryDelay(retryAfter: "2", jitter: 5), 2.2, accuracy: 0.0001)
+    }
+
     /// Диалога ещё нет (пользователь не писал) — сервер отвечает пустой лентой и 200.
     /// Для клиента это штатный старт, а не ошибка.
     func testПустаяИсторияДоПервогоСообщенияНеОшибка() async throws {

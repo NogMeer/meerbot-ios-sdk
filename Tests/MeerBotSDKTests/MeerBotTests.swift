@@ -53,6 +53,13 @@ final class MeerBotTests: XCTestCase {
         return IdentityFlagStore(defaults: defaults).pendingLogout(installationId: installationId) != nil
     }
 
+    /// Номер смены identity этой установки — то, по чему сервер упорядочивает выходы и входы
+    /// вместо часов устройства.
+    private var identitySeq: Int {
+        guard let installationId = defaults.string(forKey: "meerbot.installationId") else { return 0 }
+        return IdentityFlagStore(defaults: defaults).identitySeq(installationId: installationId)
+    }
+
     private func stubRegister(identityStatus: String = "verified", unlinked: Bool? = nil) {
         var identity: [String: Any] = ["status": identityStatus]
         if let unlinked { identity["unlinked"] = unlinked }
@@ -288,6 +295,69 @@ final class MeerBotTests: XCTestCase {
         sdk.identify(token: makeIdentityJWT(sub: "user-b"))
         XCTAssertEqual(field.wrappedValue, "", "вход другого человека стирает черновик сразу")
         await sdk.identityTask?.value
+    }
+
+    // MARK: Номер смены identity
+
+    /// Порядок применяется сервером по номеру, а не по часам: выход и вход разных людей могли
+    /// уйти из разных сетей и приехать в обратном порядке. Каждая смена обязана получить номер
+    /// больше предыдущего, и растёт он в той же критической секции, что и флаг выхода.
+    ///
+    /// Проверяется РОСТ, а не точная величина: одну смену помечают и `MeerBot` (он один знает,
+    /// кто был применён до перезапуска), и `APIClient` — номер прибавляется дважды, и это
+    /// безвредно: сервер сравнивает только «больше сохранённого».
+    func testКаждаяСменаПоднимаетНомерАОбновлениеТокенаНет() async throws {
+        let sdk = makeSDK()
+        XCTAssertEqual(identitySeq, 0, "смен не было")
+
+        sdk.identify(token: makeIdentityJWT(sub: "user-a", iat: 1))
+        await sdk.identityTask?.value
+        let afterFirstLogin = identitySeq
+        XCTAssertGreaterThan(afterFirstLogin, 0, "кто был связан до первого входа, неизвестно — это смена")
+
+        sdk.identify(token: makeIdentityJWT(sub: " user-a ", iat: 2))
+        await sdk.identityTask?.value
+        XCTAssertEqual(identitySeq, afterFirstLogin, "свежий токен того же человека — не смена")
+
+        sdk.identify(token: nil)
+        await sdk.identityTask?.value
+        let afterLogout = identitySeq
+        XCTAssertGreaterThan(afterLogout, afterFirstLogin, "выход")
+
+        sdk.identify(token: makeIdentityJWT(sub: "user-a", iat: 3))
+        await sdk.identityTask?.value
+        let afterReLogin = identitySeq
+        XCTAssertGreaterThan(afterReLogin, afterLogout, "вход после выхода — всегда новая связь")
+
+        sdk.identify(token: makeIdentityJWT(sub: "user-b"))
+        await sdk.identityTask?.value
+        XCTAssertGreaterThan(identitySeq, afterReLogin, "другой человек")
+    }
+
+    /// Номер относится к СТРОКЕ УСТРОЙСТВА этой установки: на сервере у другой установки свой
+    /// счёт, и чужой номер отбросил бы её смены как старые.
+    func testНомерПривязанКУстановке() async throws {
+        let sdk = makeSDK()
+        sdk.identify(token: nil)
+        await sdk.identityTask?.value
+        XCTAssertGreaterThan(identitySeq, 0)
+
+        let flags = IdentityFlagStore(defaults: defaults)
+        XCTAssertEqual(flags.identitySeq(installationId: "00000000-0000-4000-8000-000000000000"), 0)
+    }
+
+    /// `reset()` заводит новую установку — на сервере это чистая строка устройства, и старый
+    /// номер сделал бы её первые смены «устаревшими».
+    func testResetОбнуляетНомер() async throws {
+        let sdk = makeSDK()
+        sdk.identify(token: nil)
+        await sdk.identityTask?.value
+        XCTAssertGreaterThan(identitySeq, 0)
+
+        sdk.reset()
+
+        XCTAssertNil(defaults.string(forKey: IdentityFlagStore.identitySeqKey))
+        XCTAssertEqual(identitySeq, 0)
     }
 
     /// Выход забывает, кто был: вход того же человека после выхода — новая связь.

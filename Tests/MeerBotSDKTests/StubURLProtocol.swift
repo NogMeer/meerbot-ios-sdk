@@ -19,6 +19,16 @@ struct StubResponse {
     /// событий («история пришла после отправки»): пауза по времени делала бы такой тест
     /// зависимым от планировщика, ворота — нет.
     var gate: StubGate?
+    /// Подставить в тело ответа `clientMessageId` из ТЕЛА ЗАПРОСА вместо `$CLIENT_ID`.
+    ///
+    /// Иначе подтверждение приёма не проверить: идентификатор отправки рождается внутри
+    /// контроллера в момент `send`, а ответ стаба описывается заранее. Сервер в этом месте
+    /// ведёт себя так же — возвращает то, что получил.
+    var echoesClientMessageId: Bool = false
+    /// Чанки отданы, а завершения нет: сервер просто перестал слать байты и держит сокет.
+    /// Так выглядит зависший стрим — единственный способ проверить, что `stop()` рвёт
+    /// запрос сам, а не ждёт, пока это сделает таймаут сессии.
+    var hangs: Bool = false
 
     static func json(_ object: [String: Any], status: Int = 200) -> StubResponse {
         StubResponse(
@@ -85,7 +95,12 @@ final class StubURLProtocol: URLProtocol {
         queues = [:]
         recorded = []
         completedByPath = [:]
+        stoppedByPath = [:]
+        lastClientMessageId = nil
     }
+
+    /// Запрос уже завершён транспортом — отменять в нём нечего.
+    private var finished = false
 
     static func enqueue(path: String, _ responses: StubResponse...) {
         lock.lock(); defer { lock.unlock() }
@@ -122,12 +137,16 @@ final class StubURLProtocol: URLProtocol {
 
     override func startLoading() {
         let path = request.url?.path ?? ""
+        let body = Self.readBody(from: request)
+        if let sent = body?["clientMessageId"] as? String, !sent.isEmpty {
+            Self.rememberClientMessageId(sent)
+        }
         Self.record(
             RecordedRequest(
                 url: request.url!,
                 method: request.httpMethod ?? "GET",
                 headers: request.allHTTPHeaderFields ?? [:],
-                body: Self.readBody(from: request)
+                body: body
             )
         )
 
@@ -164,18 +183,44 @@ final class StubURLProtocol: URLProtocol {
 
         for chunk in stub.chunks {
             if stub.chunkDelay > 0 { Thread.sleep(forTimeInterval: stub.chunkDelay) }
-            client?.urlProtocol(self, didLoad: chunk)
+            client?.urlProtocol(self, didLoad: stub.echoesClientMessageId ? Self.echoing(chunk) : chunk)
         }
+
+        // Висящий ответ: байты кончились, а сокет открыт. Ни `didFinishLoading`, ни ошибки —
+        // выход из такого стрима возможен только отменой запроса.
+        if stub.hangs { return }
 
         if stub.failure != nil, stub.chunkDelay > 0 {
             Thread.sleep(forTimeInterval: stub.chunkDelay)
         }
+        Self.lock.lock()
+        finished = true
+        Self.lock.unlock()
         if let failure = stub.failure {
             client?.urlProtocol(self, didFailWithError: failure)
         } else {
             client?.urlProtocolDidFinishLoading(self)
         }
         Self.markCompleted(path)
+    }
+
+    /// Последний `clientMessageId`, пришедший в теле запроса. Историю запрашивают GET-ом, а
+    /// строка пользователя в ответе обязана нести тот же идентификатор, что ушёл в отправке.
+    private static var lastClientMessageId: String?
+
+    private static func rememberClientMessageId(_ id: String) {
+        lock.lock(); defer { lock.unlock() }
+        lastClientMessageId = id
+    }
+
+    /// `$CLIENT_ID` → идентификатор отправки. Замена побайтовая, поэтому работает и в SSE, и
+    /// в JSON-теле истории.
+    private static func echoing(_ chunk: Data) -> Data {
+        lock.lock()
+        let id = lastClientMessageId ?? ""
+        lock.unlock()
+        guard let text = String(data: chunk, encoding: .utf8) else { return chunk }
+        return Data(text.replacingOccurrences(of: "$CLIENT_ID", with: id).utf8)
     }
 
     private static var completedByPath: [String: Int] = [:]
@@ -192,7 +237,23 @@ final class StubURLProtocol: URLProtocol {
         completedByPath[path, default: 0] += 1
     }
 
-    override func stopLoading() {}
+    private static var stoppedByPath: [String: Int] = [:]
+
+    /// Сколько запросов по пути URLSession отменила. Отмена доходит до транспорта только
+    /// если её кто-то сделал: для проверки «`stop()` рвёт запрос в полёте» это и есть факт.
+    static func stopped(path: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return stoppedByPath[path] ?? 0
+    }
+
+    override func stopLoading() {
+        // `stopLoading` зовётся и после нормального завершения ответа, поэтому отменой
+        // считается только остановка НЕзавершённого запроса.
+        let path = request.url?.path ?? ""
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        guard !finished else { return }
+        Self.stoppedByPath[path, default: 0] += 1
+    }
 
     /// URLSession переносит `httpBody` в `httpBodyStream` — читаем оба варианта.
     private static func readBody(from request: URLRequest) -> [String: Any]? {

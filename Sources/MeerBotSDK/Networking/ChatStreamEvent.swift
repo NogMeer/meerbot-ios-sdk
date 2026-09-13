@@ -28,13 +28,13 @@
 import Foundation
 
 /// Ответ менеджера, пришедший в открытый стрим.
-public struct ManagerMessage: Equatable {
+public struct ManagerMessage: Equatable, Sendable {
     public let messageId: Int
     public let text: String
     public let authorName: String?
 }
 
-public enum ChatStreamEvent: Equatable {
+public enum ChatStreamEvent: Equatable, Sendable {
     case meta(conversationId: Int, mode: ChatMode)
     case contentDelta(String)
     case done
@@ -61,7 +61,7 @@ struct StreamAcceptance: Equatable, Sendable {
 
 /// Событие внутреннего потока (`APIClient.sendMessage(_:clientMessageId:)`): публичные события
 /// плюс подтверждение приёма, которое идёт СРАЗУ за своим `meta`.
-enum StreamEvent: Equatable {
+enum StreamEvent: Equatable, Sendable {
     case event(ChatStreamEvent)
     case accepted(StreamAcceptance)
 }

@@ -399,8 +399,14 @@ final class ChatControllerTests: XCTestCase {
         XCTAssertEqual(controller.store.greeting, "Здравствуйте! Мы на связи.", "приветствие задаёт хост")
 
         try await waitUntil("переподключения") { controller.isReady }
-        // Ждём, пока запоздалый ответ по пушу гарантированно долетит.
-        try await Task.sleep(nanoseconds: 500_000_000)
+        // Запоздалый ответ по пушу ждём по счётчику стенда, а не паузой.
+        try await waitUntil("ответов на все запросы истории") {
+            StubURLProtocol.completed(path: self.messagesPath)
+                == StubURLProtocol.requests(path: self.messagesPath).count
+        }
+        // Тело отдано транспорту, но до ленты его ещё несут актор клиента и главный актор —
+        // хука «ответ отброшен» у контроллера нет, поэтому переходы покрываются паузой.
+        try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertTrue(controller.store.messages.isEmpty, "пустой новый тред не возвращает старую ленту")
         let registers = StubURLProtocol.requests(path: registerPath)
         XCTAssertEqual(registers.count, 2, "открытый экран перерегистрировался")
@@ -420,6 +426,7 @@ final class ChatControllerTests: XCTestCase {
         let requestsBefore = StubURLProtocol.requests.count
 
         controller.resetForIdentityChange()
+        // Ворот нет: проверяется отсутствие запросов. Окно с запасом на планировщик.
         try await Task.sleep(nanoseconds: 200_000_000)
 
         XCTAssertTrue(controller.store.messages.isEmpty)
@@ -484,7 +491,9 @@ final class ChatControllerTests: XCTestCase {
 
         controller.beginIdentityChange()
         controller.send("привет")
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await waitUntil("ждущего сообщения в ленте") {
+            controller.store.messages.map(\.content) == ["привет"] && controller.store.sending
+        }
 
         XCTAssertEqual(controller.store.messages.map(\.content), ["привет"])
         XCTAssertTrue(controller.store.sending, "второе сообщение поверх ждущего не отправить")
@@ -505,7 +514,7 @@ final class ChatControllerTests: XCTestCase {
         controller.send("привет")
         controller.stop()
         controller.finishIdentityChange()
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await waitUntil("предложения повторить") { controller.retryableText == "привет" }
 
         XCTAssertEqual(controller.retryableText, "привет")
         XCTAssertEqual(controller.store.messages.first?.failed, true)
@@ -748,6 +757,8 @@ final class ChatControllerTests: XCTestCase {
 
         controller.openConversation(id: 55)
         controller.resetForIdentityChange()
+        try await waitUntil("снятого id диалога") { controller.conversationId == nil }
+        // Отсутствие запроса истории — отрицательный факт: окно с запасом на планировщик.
         try await Task.sleep(nanoseconds: 200_000_000)
 
         XCTAssertNil(controller.conversationId)
@@ -915,5 +926,411 @@ final class ChatControllerTests: XCTestCase {
         XCTAssertEqual(contents(controller), ["привет"])
         XCTAssertEqual(controller.store.messages.first?.failed, true)
         try await waitUntil("конца ответа транспорта") { StubURLProtocol.completed(path: self.streamPath) == 1 }
+    }
+
+    /// Отмена обязана рвать СОЕДИНЕНИЕ, а не только цикл чтения: пока запрос жив, сервер
+    /// генерирует и тарифицирует ответ, которого никто не прочитает. Проверяется на висящем
+    /// ответе — байты кончились, сокет открыт: выйти из такого стрима можно только отменой.
+    func testЗакрытиеЭкранаРвётЗапросАНеЖдётТаймаутаСессии() async throws {
+        stubRegister()
+        var hanging = StubResponse.sse(
+            "event: meta\ndata: {\"conversationId\":31,\"mode\":\"ai\"}\n\n"
+                + "data: {\"choices\":[{\"delta\":{\"content\":\"частичный\"}}]}\n\n"
+        )
+        hanging.hangs = true
+        StubURLProtocol.enqueue(path: streamPath, hanging)
+
+        let controller = makeController()
+        controller.send("привет")
+        try await waitUntil("начала ответа") { controller.store.messages.last?.content == "частичный" }
+        XCTAssertEqual(StubURLProtocol.stopped(path: streamPath), 0, "до stop() рвать нечего")
+
+        controller.stop()
+
+        try await waitUntil("отмены запроса транспортом") {
+            StubURLProtocol.stopped(path: self.streamPath) == 1
+        }
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(contents(controller), ["привет"], "недописанный пузырь убран")
+        XCTAssertEqual(controller.store.messages.first?.failed, true)
+        XCTAssertNil(controller.store.connectionError, "ошибки связи не было — экран закрыли")
+    }
+
+    // MARK: - Идемпотентная отправка (`clientMessageId`)
+
+    /// Идентификаторы отправок, дошедшие до сервера: повтор обязан нести ТОТ ЖЕ.
+    private func sentClientIds() -> [String] {
+        StubURLProtocol.requests(path: streamPath).compactMap { $0.body?["clientMessageId"] as? String }
+    }
+
+    /// Страница истории, где `$CLIENT_ID` заменяется идентификатором ушедшей отправки.
+    private func echoingHistory(_ messages: [[String: Any]], mode: String = "ai") -> StubResponse {
+        var page = StubResponse.json(["messages": messages, "hasMore": false, "mode": mode])
+        page.echoesClientMessageId = true
+        return page
+    }
+
+    private func acceptedMeta(userMessageId: Int, replayed: Bool = false) -> String {
+        "event: meta\ndata: {\"conversationId\":31,\"mode\":\"ai\","
+            + "\"clientMessageId\":\"$CLIENT_ID\",\"userMessageId\":\(userMessageId)"
+            + (replayed ? ",\"replayed\":true" : "") + "}\n\n"
+    }
+
+    /// Сервер подтвердил приём, и связь оборвалась до ответа. «Повторить» остаётся доступным
+    /// (ответа-то нет), но повтор идёт с тем же идентификатором: сервер узнаёт его, отдаёт
+    /// сохранённое сообщение (`replayed`) и один ответ — ни второй строки в треде, ни второго
+    /// платного ответа модели.
+    func testПовторПослеПодтверждённогоПриёмаНесётТотЖеIdИНеДвоитОтвет() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse(acceptedMeta(userMessageId: 501))
+        dropped.echoesClientMessageId = true
+        dropped.failure = URLError(.networkConnectionLost)
+        dropped.chunkDelay = 0.05
+        var replay = StubResponse.sse(
+            acceptedMeta(userMessageId: 501, replayed: true)
+                + "data: {\"choices\":[{\"delta\":{\"content\":\"Готово\"}}]}\n\ndata: [DONE]\n\n"
+        )
+        replay.echoesClientMessageId = true
+        StubURLProtocol.enqueue(path: streamPath, dropped, replay)
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            // Стартовая лента: догон после потока работает только на готовой сессии.
+            .json(["messages": [], "hasMore": false, "mode": "ai"]),
+            // Сверка после обрыва: сообщение сервер записал, ответа ещё нет.
+            echoingHistory([
+                ["id": 501, "role": "user", "content": "привет", "clientMessageId": "$CLIENT_ID", "createdAt": now()],
+            ]),
+            // Догон после успешного повтора: ответ у сервера уже есть.
+            echoingHistory([
+                ["id": 501, "role": "user", "content": "привет", "clientMessageId": "$CLIENT_ID", "createdAt": now()],
+                ["id": 502, "role": "assistant", "content": "Готово", "createdAt": now()],
+            ])
+        )
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("готовности сессии") { controller.isReady }
+        controller.send("привет")
+        let local = try XCTUnwrap(controller.store.messages.first)
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(controller.store.messages.first?.serverId, 501, "приём подтверждён — id уже серверный")
+        XCTAssertEqual(controller.store.messages.first?.failed, true, "ответа нет — повтор предлагаем")
+
+        controller.retry()
+
+        try await waitUntil("ответа на повтор") {
+            controller.store.messages.map(\.serverId) == [501, 502]
+        }
+        XCTAssertEqual(contents(controller), ["привет", "Готово"], "ответ нарисован один раз")
+        XCTAssertEqual(controller.store.messages.filter { $0.role == "user" }.count, 1, "дубля нет")
+        XCTAssertEqual(controller.store.messages.first?.failed, false)
+        XCTAssertNil(controller.retryableText)
+        XCTAssertEqual(
+            sentClientIds(),
+            [local.id.lowercased(), local.id.lowercased()],
+            "оба запроса несут один идентификатор — повтор идемпотентен"
+        )
+    }
+
+    /// Повтор тапом по пузырю — тот же путь и тот же идентификатор. Второй тап, пока отправка
+    /// идёт, игнорируется: второй поток поверх первого сломал бы и `sending`, и плейсхолдер.
+    func testПовторТапомПоПузырюНесётТотЖеIdАВторойТапИгнорируется() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse("")
+        dropped.failure = URLError(.networkConnectionLost)
+        let gate = StubGate()
+        var reply = StubResponse.sse("data: {\"choices\":[{\"delta\":{\"content\":\"Готово\"}}]}\n\ndata: [DONE]\n\n")
+        reply.gate = gate
+        StubURLProtocol.enqueue(path: streamPath, dropped, reply)
+        stubHistory() // догон после успешной отправки
+
+        let controller = makeController()
+        controller.send("привет")
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        let local = try XCTUnwrap(controller.store.messages.first)
+
+        controller.retry(messageId: local.id)
+        XCTAssertTrue(controller.store.sending)
+        XCTAssertEqual(controller.store.messages.first?.failed, false, "пометка снята на время повтора")
+        controller.retry(messageId: local.id)
+
+        try await waitUntil("второго запроса") { StubURLProtocol.requests(path: self.streamPath).count == 2 }
+        gate.open()
+        try await waitUntil("конца ответа") {
+            !controller.store.sending && controller.store.messages.last?.content == "Готово"
+        }
+        XCTAssertEqual(StubURLProtocol.requests(path: streamPath).count, 2, "третьей отправки не было")
+        XCTAssertEqual(sentClientIds(), [local.id.lowercased(), local.id.lowercased()])
+    }
+
+    /// 409 `generation_in_progress`: повтор пришёл, пока ответ на это сообщение ещё
+    /// генерируется. Сообщение УЖЕ у сервера, поэтому «Повторить» — про ожидание, а не про
+    /// потерю; догон, увидев ответ, снимает и пометку, и кнопку.
+    func testОтветЕщёГотовитсяОставляетПовторАДогонЕгоСнимает() async throws {
+        stubRegister()
+        stubHistory() // стартовая лента пуста
+        StubURLProtocol.enqueue(
+            path: streamPath,
+            .json([
+                "error": [
+                    "type": "conflict", "code": "generation_in_progress", "message": "busy",
+                ],
+            ], status: 409)
+        )
+        stubHistory([
+            ["id": 1, "role": "user", "content": "привет", "createdAt": now()],
+            ["id": 2, "role": "assistant", "content": "Ответ", "createdAt": now()],
+        ])
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("готовности сессии") { controller.isReady }
+
+        controller.send("привет")
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(controller.store.connectionError, "Ответ ещё готовится. Повторите чуть позже.")
+        XCTAssertEqual(controller.store.messages.first?.failed, true)
+        XCTAssertEqual(StubURLProtocol.requests(path: streamPath).count, 1, "409 сам не повторяется")
+
+        controller.refresh()
+
+        try await waitUntil("догона с ответом") { self.contents(controller) == ["привет", "Ответ"] }
+        XCTAssertEqual(controller.store.messages.first?.failed, false, "сообщение дошло — пометки нет")
+        XCTAssertNil(controller.retryableText)
+        XCTAssertEqual(StubURLProtocol.requests(path: streamPath).count, 1, "догон ничего не отправляет")
+    }
+
+    /// Сервер записал сообщение и сорвался на генерации (`generation_failed`). Повтор
+    /// идемпотентен, поэтому предлагаем его — ответа-то так и нет.
+    func testОшибкаГенерацииПослеПодтверждённогоПриёмаПредлагаетПовтор() async throws {
+        stubRegister()
+        var failed = StubResponse.sse(
+            acceptedMeta(userMessageId: 501)
+                + "event: error\ndata: {\"code\":\"generation_failed\",\"message\":\"boom\"}\n\n"
+        )
+        failed.echoesClientMessageId = true
+        StubURLProtocol.enqueue(path: streamPath, failed)
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json(["messages": [], "hasMore": false, "mode": "ai"]), // старт
+            // Догон сразу после потока: сообщение на сервере есть, ответа нет.
+            echoingHistory([
+                ["id": 501, "role": "user", "content": "привет", "clientMessageId": "$CLIENT_ID", "createdAt": now()],
+            ])
+        )
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("готовности сессии") { controller.isReady }
+        controller.send("привет")
+
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        XCTAssertEqual(controller.retryableText, "привет")
+        XCTAssertEqual(controller.store.messages.first?.serverId, 501, "приём подтверждён")
+        XCTAssertEqual(contents(controller), ["привет"], "пустой пузырь ответа убран")
+        XCTAssertFalse(controller.store.sending)
+    }
+
+    /// Диалог у менеджера: автоматического ответа не будет вовсе, и сообщение считается
+    /// устроенным без него — «Повторить» здесь отправило бы дубль живому человеку.
+    func testВHumanРежимеПодтверждённоеСообщениеПовторНеПредлагает() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse(acceptedMeta(userMessageId: 501))
+        dropped.echoesClientMessageId = true
+        dropped.failure = URLError(.networkConnectionLost)
+        dropped.chunkDelay = 0.05
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            echoingHistory([
+                ["id": 501, "role": "user", "content": "привет", "clientMessageId": "$CLIENT_ID", "createdAt": now()],
+            ], mode: "human")
+        )
+
+        let controller = makeController()
+        controller.send("привет")
+
+        try await waitUntil("сверки с сервером") { controller.store.mode == .human }
+        try await waitUntil("конца отправки") { !controller.store.sending }
+        XCTAssertEqual(controller.store.messages.first?.failed, false, "повторять нечего — отвечает человек")
+        XCTAssertNil(controller.retryableText)
+    }
+
+    /// Сменился пользователь — повторять нечего: строка прежнего человека стёрта, и «Повторить»
+    /// не имеет права отправить его текст в тред следующего.
+    func testПослеСменыIdentityПовторНичегоНеОтправляет() async throws {
+        stubRegister()
+        var dropped = StubResponse.sse("")
+        dropped.failure = URLError(.networkConnectionLost)
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+
+        let controller = makeController()
+        controller.send("мой номер договора 123")
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+        let streamsBefore = StubURLProtocol.requests(path: streamPath).count
+
+        controller.resetForIdentityChange()
+        controller.retry()
+
+        // `run` ставит `sending` и пузырь синхронно: отправка была бы видна уже здесь.
+        XCTAssertTrue(controller.store.messages.isEmpty)
+        XCTAssertFalse(controller.store.sending)
+        XCTAssertNil(controller.retryableText)
+        XCTAssertEqual(StubURLProtocol.requests(path: streamPath).count, streamsBefore)
+    }
+
+    /// Старый сервер подтверждений не присылает и ключа в истории не отдаёт: экран остаётся на
+    /// прежнем сопоставлении по тексту, а лишний `clientMessageId` в теле запроса ему не мешает.
+    func testСтарыйСерверПоддержкуНеОбъявляетИПоведениеПрежнее() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: streamPath,
+            .sse(
+                "event: meta\ndata: {\"conversationId\":31,\"mode\":\"ai\"}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"content\":\"Ответ\"}}]}\n\ndata: [DONE]\n\n"
+            )
+        )
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json(["messages": [], "hasMore": false, "mode": "ai"]), // старт
+            .json([
+                "messages": [
+                    ["id": 1, "role": "user", "content": "привет", "createdAt": now()],
+                    ["id": 2, "role": "assistant", "content": "Ответ", "createdAt": now()],
+                ],
+                "hasMore": false,
+                "mode": "ai",
+            ])
+        )
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("готовности сессии") { controller.isReady }
+        controller.send("привет")
+
+        try await waitUntil("серверных id после догона") {
+            controller.store.messages.map(\.serverId) == [1, 2]
+        }
+        XCTAssertFalse(controller.store.clientIdsSupported, "подтверждений не было — поддержки нет")
+        XCTAssertEqual(contents(controller), ["привет", "Ответ"], "сопоставление по тексту, как прежде")
+        XCTAssertNil(controller.retryableText)
+        XCTAssertEqual(sentClientIds().count, 1, "id в теле уходит всегда — старый сервер его игнорирует")
+    }
+
+    // MARK: - Устройство сменило строку
+
+    /// Сервер выдал устройству ДРУГУЮ строку (прежнюю увели в отставку): курсор, серверные id и
+    /// id диалога прежней к новому треду не относятся. Лента сбрасывается, история читается
+    /// ЦЕЛИКОМ (без `since`), а набранное и не дошедшее сообщение остаётся — терять его молча
+    /// нельзя, человек тот же.
+    func testСменаСтрокиУстройстваСбрасываетЛентуИЧитаетИсториюЦеликом() async throws {
+        StubURLProtocol.enqueue(
+            path: registerPath,
+            .json([
+                "deviceId": "42", "jwt": "jwt-1", "expiresIn": 900,
+                "identity": ["status": "not_provided"],
+            ]),
+            .json([
+                "deviceId": "77", "jwt": "jwt-2", "expiresIn": 900,
+                "identity": ["status": "not_provided"],
+            ])
+        )
+        let oldThread: [[String: Any]] = [
+            ["id": 21, "role": "user", "content": "прежний вопрос", "createdAt": now(offset: -60)],
+            ["id": 22, "role": "assistant", "content": "прежний ответ", "createdAt": now(offset: -59)],
+        ]
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json(["messages": oldThread, "hasMore": false, "mode": "ai"]), // старт
+            .json(["messages": oldThread, "hasMore": false, "mode": "ai"]), // пуш с id диалога
+            // Устройство снято: клиент перерегистрируется и повторяет запрос сам.
+            .json([
+                "error": ["type": "authentication_error", "code": "device_not_found", "message": "gone"],
+            ], status: 401),
+            .json(["messages": [], "hasMore": false, "mode": "ai"]), // страница по прежнему курсору
+            .json([
+                "messages": [
+                    ["id": 5, "role": "assistant", "content": "новый тред", "createdAt": now()],
+                ],
+                "hasMore": false,
+                "mode": "ai",
+            ])
+        )
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("ленты прежней строки устройства") {
+            controller.isReady && controller.store.lastServerMessageId == 22
+        }
+        controller.openConversation(id: 55)
+        try await waitUntil("id диалога") { controller.conversationId == 55 }
+
+        controller.refresh()
+
+        try await waitUntil("истории новой строки устройства") {
+            self.contents(controller) == ["новый тред"]
+        }
+        XCTAssertEqual(controller.store.messages.map(\.serverId), [5])
+        XCTAssertEqual(controller.store.lastServerMessageId, 5, "курсор прежней строки сброшен")
+        XCTAssertNil(controller.conversationId, "диалог прежней строки к новой не относится")
+        XCTAssertEqual(StubURLProtocol.requests(path: registerPath).count, 2)
+        let lastHistory = try XCTUnwrap(StubURLProtocol.requests(path: messagesPath).last)
+        XCTAssertFalse(
+            (lastHistory.url.query ?? "").contains("since="),
+            "историю новой строки читаем целиком: \(lastHistory.url.query ?? "")"
+        )
+    }
+
+    /// Та же смена строки, но у пользователя есть не дошедшее сообщение: оно принадлежит ему,
+    /// а не строке устройства, и обязано остаться в ленте с «Повторить».
+    func testСменаСтрокиУстройстваСохраняетНедоставленноеСообщение() async throws {
+        StubURLProtocol.enqueue(
+            path: registerPath,
+            .json([
+                "deviceId": "42", "jwt": "jwt-1", "expiresIn": 900,
+                "identity": ["status": "not_provided"],
+            ]),
+            .json([
+                "deviceId": "77", "jwt": "jwt-2", "expiresIn": 900,
+                "identity": ["status": "not_provided"],
+            ])
+        )
+        // Вся очередь истории раскладывается ЗАРАНЕЕ: последний ответ стаба повторяется, и
+        // досыпанный после старта оказался бы не первым в очереди, а вторым.
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json([
+                "messages": [
+                    ["id": 21, "role": "user", "content": "прежний вопрос", "createdAt": now(offset: -60)],
+                ],
+                "hasMore": false,
+                "mode": "ai",
+            ]),
+            // Устройство снято: клиент перерегистрируется и повторяет запрос сам.
+            .json([
+                "error": ["type": "authentication_error", "code": "device_not_found", "message": "gone"],
+            ], status: 401),
+            .json(["messages": [], "hasMore": false, "mode": "ai"])
+        )
+        var dropped = StubResponse.sse("")
+        dropped.failure = URLError(.networkConnectionLost)
+        StubURLProtocol.enqueue(path: streamPath, dropped)
+
+        let controller = makeController()
+        controller.start()
+        try await waitUntil("стартовой ленты") { controller.isReady }
+        controller.send("новое сообщение")
+        try await waitUntil("пометки недоставленным") { controller.retryableText != nil }
+
+        controller.refresh()
+
+        try await waitUntil("сброса ленты прежней строки") {
+            self.contents(controller) == ["новое сообщение"]
+        }
+        XCTAssertEqual(controller.store.messages.first?.failed, true, "сообщение осталось с «Повторить»")
+        XCTAssertNil(controller.store.messages.first?.serverId, "серверный id прежней строки снят")
+        XCTAssertEqual(controller.retryableText, "новое сообщение")
     }
 }

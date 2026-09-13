@@ -126,4 +126,66 @@ final class SSEParserTests: XCTestCase {
         let sse = SSEEvent(name: "quantum_flux", data: "{}")
         XCTAssertEqual(ChatStreamEvent.from(sse), .unknown(name: "quantum_flux"))
     }
+
+    // MARK: - Подтверждение приёма (`clientMessageId`)
+
+    func testMetaСIdДаётПодтверждениеПриёма() {
+        let sse = SSEEvent(
+            name: "meta",
+            data: """
+            {"conversationId":15,"mode":"ai","clientMessageId":"f7c1f0c2-0000-4000-8000-000000000001",\
+            "userMessageId":501,"replayed":true}
+            """
+        )
+
+        XCTAssertEqual(
+            ChatStreamEvent.acceptance(from: sse),
+            StreamAcceptance(
+                clientMessageId: "f7c1f0c2-0000-4000-8000-000000000001",
+                userMessageId: 501,
+                replayed: true
+            )
+        )
+        // Публичное событие из того же кадра не меняется: хосты, разбирающие поток сами,
+        // продолжают видеть прежний `meta`.
+        XCTAssertEqual(ChatStreamEvent.from(sse), .meta(conversationId: 15, mode: .ai))
+    }
+
+    func testReplayedПоУмолчаниюFalse() {
+        let sse = SSEEvent(
+            name: "meta",
+            data: "{\"conversationId\":1,\"mode\":\"ai\",\"clientMessageId\":\"abc\",\"userMessageId\":7}"
+        )
+        XCTAssertEqual(ChatStreamEvent.acceptance(from: sse)?.replayed, false)
+    }
+
+    /// Старый сервер (или запрос без id) полей не присылает: подтверждения нет, и экран
+    /// остаётся на сопоставлении по тексту.
+    func testMetaБезПолейПодтверждениемНеСтановится() {
+        let sse = SSEEvent(name: "meta", data: "{\"conversationId\":15,\"mode\":\"ai\"}")
+        XCTAssertNil(ChatStreamEvent.acceptance(from: sse))
+    }
+
+    func testПустойИлиНечисловойIdПодтверждениемНеСтановится() {
+        let empty = SSEEvent(
+            name: "meta",
+            data: "{\"clientMessageId\":\"\",\"userMessageId\":7}"
+        )
+        XCTAssertNil(ChatStreamEvent.acceptance(from: empty))
+
+        let notANumber = SSEEvent(
+            name: "meta",
+            data: "{\"clientMessageId\":\"abc\",\"userMessageId\":\"7\"}"
+        )
+        XCTAssertNil(ChatStreamEvent.acceptance(from: notANumber), "id сообщения — число, а не строка")
+    }
+
+    /// Те же поля в другом кадре подтверждением не считаются: приём подтверждает только `meta`.
+    func testПодтверждениеЧитаетсяТолькоИзMeta() {
+        let sse = SSEEvent(
+            name: "manager_message",
+            data: "{\"clientMessageId\":\"abc\",\"userMessageId\":7,\"text\":\"я тут\"}"
+        )
+        XCTAssertNil(ChatStreamEvent.acceptance(from: sse))
+    }
 }
