@@ -5,6 +5,35 @@
 До `1.0.0` минорная версия может нести ломающие изменения публичного API; правило подключения
 «Up to Next Minor» на этот период надёжнее, чем «Up to Next Major».
 
+## [0.4.0] — 2026-09-19
+
+### Добавлено
+- **Вложения в чате (паритет с Android).** Скрепка в композере открывает выбор «фото и
+  видео» (`PHPickerViewController`, разрешения не требует — работает вне процесса) или
+  «файл» (`UIDocumentPickerViewController`); выбранное показывается превью-чипами над полем
+  и уходит по кнопке отправки. Загрузка — `POST /api/v1/mobile/upload` (multipart, поле
+  `file`) → `uploadId`; отправка сообщения несёт `uploadIds` в теле `POST /mobile/chat/stream`
+  (текст при этом может быть пустым, лимит ≤10). Приходящие вложения (история и событие
+  `manager_message`) разбираются в `Attachment` и рисуются: картинка — инлайн (качается
+  авторизованным запросом `GET /mobile/media/<messageId>/<mediaId>` с кэшем в памяти),
+  прочее — плашкой «иконка + имя + размер».
+- **Публичный API.** `MeerBotPlatform.Attachment`, `OutgoingAttachment`, `AttachmentKind`,
+  `UploadResult`; `ChatMessage.attachments`; `APIClient.uploadAttachment(data:fileName:mime:)`,
+  `APIClient.mediaData(messageId:mediaId:)`, `APIClient.maxAttachments`;
+  `ChatController.send(_:attachments:)` и `ChatController.loadMedia(messageId:mediaId:)`.
+
+### Shadow-пути
+- Сбой загрузки файла помечает сообщение недоставленным и НЕ теряет ни текст, ни файлы —
+  «Повторить» повторяет и загрузку. Отмена picker'а — no-op. Не загрузившаяся картинка
+  показывается плашкой, а не крашем/пустотой. Смена пользователя стирает недогруженные файлы
+  вместе с лентой.
+
+### Совместимость
+- `ChatController.send(_:)` и публичное тело потока без вложений не изменились (`uploadIds` в
+  тело не попадают). `HistoryMessage`/`ManagerMessage`/`ChatMessage`/`appendUserMessage`/
+  `appendOperatorMessage` получили новые параметры со значениями по умолчанию — существующие
+  вызовы не ломаются. Старый сервер без полей вложений работает как раньше.
+
 ## [0.3.0] — 2026-09-19
 
 ### Добавлено

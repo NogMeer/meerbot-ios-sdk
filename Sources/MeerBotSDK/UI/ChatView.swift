@@ -58,7 +58,11 @@ public struct ChatView: View {
                 )
                 Divider()
             }
-            MessagesList(store: store, onRetry: { controller.retry(messageId: $0) })
+            MessagesList(
+                store: store,
+                onRetry: { controller.retry(messageId: $0) },
+                loadMedia: { try await controller.loadMedia(messageId: $0, mediaId: $1) }
+            )
                 // ТАП по переписке убирает клавиатуру. Протягивания
                 // (`scrollDismissesKeyboard`) недостаточно: оно требует, чтобы списку было
                 // куда прокручиваться, а в свежем диалоге сообщений одно-два — тянуть
@@ -90,7 +94,8 @@ public struct ChatView: View {
                 store: store,
                 primaryColor: primaryColor,
                 isFocused: $inputFocused,
-                onSend: { controller.send($0) }
+                onSend: { controller.send($0) },
+                onSendAttachments: { controller.send($0, attachments: $1) }
             )
         }
         .background(Color.mbSurface)
@@ -149,6 +154,8 @@ struct MessagesList: View {
     @ObservedObject var store: ChatStore
     /// Тап по недоставленному пузырю — повтор именно этой строки.
     let onRetry: (String) -> Void
+    /// Загрузчик картинок вложений — прокидывается в пузырь.
+    let loadMedia: MediaLoader
 
     /// Первая порция истории уже показана? До неё прыжок вниз делается БЕЗ анимации.
     ///
@@ -184,8 +191,13 @@ struct MessagesList: View {
             // `.equatable()` — из-за черновика. Поле ввода привязано к `ChatStore.draft`, и
             // каждая буква публикует изменение всего стора: этот вью перестраивается. Сама
             // лента при этом не пересобирается — массив тот же, и сравнение отвечает сразу.
-            MessagesFeed(messages: store.messages, greeting: store.greeting, onRetry: onRetry)
-                .equatable()
+            MessagesFeed(
+                messages: store.messages,
+                greeting: store.greeting,
+                onRetry: onRetry,
+                loadMedia: loadMedia
+            )
+            .equatable()
         }
         // Открытие экрана. Одного `onChange` мало: `ChatStore` живёт в синглтоне
         // `MeerBot.shared` и переживает закрытие чата, поэтому при ПОВТОРНОМ открытии
@@ -255,6 +267,8 @@ struct MessagesFeed: View, Equatable {
     let messages: [ChatMessage]
     let greeting: String?
     let onRetry: (String) -> Void
+    /// Загрузчик картинок вложений. В сравнение не входит (замыкание), как и `onRetry`.
+    let loadMedia: MediaLoader
 
     /// Сравнение — по данным ленты; замыкание повтора в него не входит (оно пересоздаётся на
     /// каждом кадре и сравнимым не бывает, а зовёт одно и то же).
@@ -285,7 +299,8 @@ struct MessagesFeed: View, Equatable {
                     MessageBubbleView(
                         message: msg,
                         // Повторяется только своё сообщение: у ответов ассистента повторять нечего.
-                        onRetry: msg.role == "user" ? { onRetry(msg.id) } : nil
+                        onRetry: msg.role == "user" ? { onRetry(msg.id) } : nil,
+                        loadMedia: loadMedia
                     )
                     .id(msg.id)
                 }
@@ -321,6 +336,15 @@ struct ChatInput: View {
     /// Фокус ввода принадлежит экрану целиком (см. `ChatView.inputFocused`).
     @FocusState.Binding var isFocused: Bool
     let onSend: (String) -> Void
+    /// Отправка с вложениями. На платформах без выбора файлов (macOS) не вызывается.
+    var onSendAttachments: (String, [OutgoingAttachment]) -> Void = { _, _ in }
+
+    /// Выбранные, но ещё не отправленные файлы — показываются превью-чипами над полем.
+    @State private var picks: [OutgoingAttachment] = []
+    #if canImport(UIKit)
+    /// Какой системный picker сейчас открыт (`nil` — закрыт).
+    @State private var activePicker: AttachmentPickerKind?
+    #endif
 
     /// Текст поля живёт в `ChatStore.draft`, а не в `@State` этого вью.
     ///
@@ -348,33 +372,133 @@ struct ChatInput: View {
         }
     }
 
+    /// Можно ли отправлять: есть текст ИЛИ вложение, и ничего сейчас не уходит.
+    private var canSend: Bool {
+        (!trimmed.isEmpty || !picks.isEmpty) && !store.sending && store.mode != .closed
+    }
+
     var body: some View {
-        HStack(spacing: 8) {
-            // Многострочный ввод (`axis:`) появился только в iOS 16 — на iOS 15
-            // остаётся однострочное поле, всё остальное поведение то же.
-            textField
-                .focused($isFocused)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color.mbSurfaceSecondary)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .disabled(store.mode == .closed)
-            Button(action: {
-                guard !trimmed.isEmpty, !store.sending, store.mode != .closed else { return }
-                let text = trimmed
-                store.clearDraft()
-                onSend(text)
-            }) {
-                Image(systemName: "paperplane.fill")
-                    .padding(8)
-                    .background(primaryColor)
-                    .foregroundColor(.white)
-                    .clipShape(Circle())
+        VStack(spacing: 6) {
+            if !picks.isEmpty {
+                pickPreviews
             }
-            .disabled(trimmed.isEmpty || store.sending)
-            .accessibilityLabel("Отправить")
+            HStack(spacing: 8) {
+                #if canImport(UIKit)
+                attachButton
+                #endif
+                // Многострочный ввод (`axis:`) появился только в iOS 16 — на iOS 15
+                // остаётся однострочное поле, всё остальное поведение то же.
+                textField
+                    .focused($isFocused)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.mbSurfaceSecondary)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .disabled(store.mode == .closed)
+                Button(action: sendTapped) {
+                    Image(systemName: "paperplane.fill")
+                        .padding(8)
+                        .background(primaryColor)
+                        .foregroundColor(.white)
+                        .clipShape(Circle())
+                }
+                .disabled(!canSend)
+                .accessibilityLabel("Отправить")
+            }
         }
         .padding(8)
         .background(Color.mbSurface)
+        #if canImport(UIKit)
+        .sheet(item: $activePicker) { kind in
+            switch kind {
+            case .media:
+                MediaPicker(remaining: APIClient.maxAttachments - picks.count, onPicked: addPicks)
+            case .file:
+                DocumentPicker(onPicked: addPicks)
+            }
+        }
+        #endif
     }
+
+    /// Отправить: с вложениями — своим путём, без них — прежним. Текст и файлы уходят из
+    /// композера вместе; ошибку доставки покажет уже лента (недоставленная строка).
+    private func sendTapped() {
+        guard canSend else { return }
+        let text = trimmed
+        if picks.isEmpty {
+            store.clearDraft()
+            onSend(text)
+        } else {
+            let files = picks
+            store.clearDraft()
+            picks = []
+            onSendAttachments(text, files)
+        }
+    }
+
+    /// Добавить выбранное, не превышая лимит. Отмена picker'а даёт пустой массив — no-op.
+    private func addPicks(_ new: [OutgoingAttachment]) {
+        guard !new.isEmpty else { return }
+        let room = APIClient.maxAttachments - picks.count
+        guard room > 0 else { return }
+        picks.append(contentsOf: new.prefix(room))
+    }
+
+    /// Ряд превью выбранных файлов с кнопкой удаления у каждого.
+    private var pickPreviews: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(picks.enumerated()), id: \.offset) { index, item in
+                    HStack(spacing: 6) {
+                        Image(systemName: mbAttachmentIcon(kind: item.kind))
+                            .font(.system(size: 14))
+                            .foregroundColor(primaryColor)
+                        Text(item.fileName)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button {
+                            picks.remove(at: index)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Убрать вложение")
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.mbSurfaceSecondary)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .frame(maxWidth: 180)
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+    }
+
+    #if canImport(UIKit)
+    /// Скрепка: выбор «фото и видео» или «файл». Гаснет на закрытом диалоге и на лимите ≤10.
+    private var attachButton: some View {
+        Menu {
+            Button {
+                activePicker = .media
+            } label: {
+                Label("Фото и видео", systemImage: "photo")
+            }
+            Button {
+                activePicker = .file
+            } label: {
+                Label("Файл", systemImage: "doc")
+            }
+        } label: {
+            Image(systemName: "paperclip")
+                .font(.system(size: 20))
+                .foregroundColor(.secondary)
+                .padding(6)
+        }
+        .disabled(store.mode == .closed || picks.count >= APIClient.maxAttachments)
+        .accessibilityLabel("Прикрепить файл")
+    }
+    #endif
 }

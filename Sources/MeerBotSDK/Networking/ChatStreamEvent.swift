@@ -32,6 +32,9 @@ public struct ManagerMessage: Equatable, Sendable {
     public let messageId: Int
     public let text: String
     public let authorName: String?
+    /// Вложения ответа менеджера. Раздаются по `messageId` (см. `Attachment`). Пусто —
+    /// вложений нет либо сервер старый (поля не шлёт).
+    public var attachments: [Attachment] = []
 }
 
 public enum ChatStreamEvent: Equatable, Sendable {
@@ -93,11 +96,13 @@ extension ChatStreamEvent {
 
         case "manager_message":
             guard let text = json?["text"] as? String else { return nil }
+            let attachments = (json?["attachments"] as? [[String: Any]]).map(Attachment.parse) ?? []
             return .managerMessage(
                 ManagerMessage(
                     messageId: (json?["messageId"] as? Int) ?? 0,
                     text: text,
-                    authorName: json?["authorName"] as? String
+                    authorName: json?["authorName"] as? String,
+                    attachments: attachments
                 )
             )
 

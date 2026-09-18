@@ -2,10 +2,13 @@
 //
 // ── Контракт канала `mobile_app` (сверено по коду agentbot-platform на 2026-08-15) ──────
 //
-// ОДИН ключ `pk_live_*` мобильного приложения и три эндпоинта СВОЕГО канала:
+// ОДИН ключ `pk_live_*` мобильного приложения и эндпоинты СВОЕГО канала:
 //   POST /api/v1/mobile/register     — регистрация устройства → JWT (claim `ch=mobile_app`)
-//   POST /api/v1/mobile/chat/stream  — SSE-поток ответа (тело: {message, clientMessageId?})
-//   GET  /api/v1/mobile/messages     — догон истории (?since&limit)
+//   POST /api/v1/mobile/chat/stream  — SSE-поток ответа (тело: {message, clientMessageId?,
+//                                      uploadIds?}); `message` может быть пустым при uploadIds
+//   GET  /api/v1/mobile/messages     — догон истории (?since&limit), несёт attachments
+//   POST /api/v1/mobile/upload       — загрузка вложения (multipart `file`) → uploadId
+//   GET  /api/v1/mobile/media/<messageId>/<mediaId> — раздача вложения (Bearer, Range)
 //
 // ── Что изменилось против 0.1.x и почему ────────────────────────────────────────────────
 //
@@ -202,6 +205,9 @@ public struct HistoryMessage: Equatable {
     /// нет вовсе) или сервер старый. Ключ узнавания своего сообщения в ленте: он точный, в
     /// отличие от сравнения текста.
     public let clientMessageId: String?
+    /// Вложения сообщения (`WidgetAttachmentDTO` бэкенда, без `r2Key`). Пусто у старого
+    /// сервера или сообщений без файлов. Раздача — по паре `id` (messageId) + `mediaId`.
+    public let attachments: [Attachment]
 
     public init(
         id: Int,
@@ -210,7 +216,8 @@ public struct HistoryMessage: Equatable {
         createdAt: Date?,
         authorKind: String? = nil,
         authorName: String? = nil,
-        clientMessageId: String? = nil
+        clientMessageId: String? = nil,
+        attachments: [Attachment] = []
     ) {
         self.id = id
         self.role = role
@@ -219,6 +226,7 @@ public struct HistoryMessage: Equatable {
         self.authorKind = authorKind
         self.authorName = authorName
         self.clientMessageId = clientMessageId
+        self.attachments = attachments
     }
 }
 
@@ -247,6 +255,17 @@ public struct HistoryPage: Equatable {
         self.mode = mode
         self.clientMessageIdsSupported = clientMessageIdsSupported
     }
+}
+
+/// Результат загрузки вложения (`POST /api/v1/mobile/upload`). `uploadId` уходит в тело
+/// отправки сообщения (`uploadIds`), где сервер резолвит его в постоянное вложение.
+public struct UploadResult: Equatable, Sendable {
+    public let uploadId: String
+    /// `image | video | audio | document` — вид, определённый СЕРВЕРОМ по содержимому.
+    public let kind: String
+    public let mime: String
+    public let fileName: String?
+    public let size: Int
 }
 
 // MARK: - Отложенный выход
@@ -771,7 +790,8 @@ public actor APIClient {
                 createdAt: (item["createdAt"] as? String).flatMap { formatter.date(from: $0) },
                 authorKind: item["authorKind"] as? String,
                 authorName: item["authorName"] as? String,
-                clientMessageId: item["clientMessageId"] as? String
+                clientMessageId: item["clientMessageId"] as? String,
+                attachments: (item["attachments"] as? [[String: Any]]).map(Attachment.parse) ?? []
             )
         }
         if let last = messages.last?.id { lastMessageId = last }
@@ -782,6 +802,72 @@ public actor APIClient {
             mode: ChatMode(rawValue: (json["mode"] as? String) ?? "") ?? .ai,
             clientMessageIdsSupported: clientIdsSupported
         )
+    }
+
+    // MARK: Вложения
+
+    /// Максимум вложений на сообщение — совпадает с `MAX_WIDGET_ATTACHMENTS` бэкенда.
+    public static let maxAttachments = 10
+
+    /// Загрузить файл в staging (`POST /api/v1/mobile/upload`, multipart, поле `file`).
+    /// Возвращает `uploadId`, который затем уходит в `sendMessage(_:uploadIds:)`.
+    ///
+    /// Авторизованный запрос: 401 по протухшему токену лечится перерегистрацией и повтором
+    /// (`performAuthorized`). `mime`/`kind` в итоге определяет СЕРВЕР по содержимому — ответ
+    /// несёт серверно-валидированные значения, а не то, что заявил клиент.
+    public func uploadAttachment(data: Data, fileName: String, mime: String) async throws -> UploadResult {
+        var request = makeRequest(path: "/api/v1/mobile/upload", method: "POST")
+        let boundary = "meerbot.\(UUID().uuidString)"
+        // Перебивает `application/json`, выставленный `makeRequest`.
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")
+        request.httpBody = Self.multipartBody(boundary: boundary, fileName: fileName, mime: mime, data: data)
+
+        let respData = try await performAuthorized(request)
+        guard
+            let json = (try? JSONSerialization.jsonObject(with: respData)) as? [String: Any],
+            let uploadId = json["uploadId"] as? String
+        else {
+            throw MeerBotError.invalidResponse
+        }
+        return UploadResult(
+            uploadId: uploadId,
+            kind: (json["kind"] as? String) ?? AttachmentKind.classify(mime),
+            mime: (json["mime"] as? String) ?? mime,
+            fileName: json["fileName"] as? String,
+            size: (json["size"] as? Int) ?? data.count
+        )
+    }
+
+    /// Тело multipart с единственным полем `file`. Имя файла экранируется — перевод строки и
+    /// кавычка в нём иначе сломали бы заголовок части.
+    static func multipartBody(boundary: String, fileName: String, mime: String, data: Data) -> Data {
+        let safeName = fileName
+            .replacingOccurrences(of: "\"", with: "_")
+            .replacingOccurrences(of: "\r", with: "_")
+            .replacingOccurrences(of: "\n", with: "_")
+        var body = Data()
+        func append(_ string: String) { body.append(Data(string.utf8)) }
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeName)\"\r\n")
+        append("Content-Type: \(mime)\r\n\r\n")
+        body.append(data)
+        append("\r\n--\(boundary)--\r\n")
+        return body
+    }
+
+    /// Скачать вложение (`GET /api/v1/mobile/media/<messageId>/<mediaId>`, Bearer). Возвращает
+    /// сырые байты — вызывающий сам превращает их в картинку. Авторизация лечится повтором.
+    public func mediaData(messageId: Int, mediaId: String) async throws -> Data {
+        let url = config.baseURL
+            .appendingPathComponent("/api/v1/mobile/media")
+            .appendingPathComponent(String(messageId))
+            .appendingPathComponent(mediaId)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyCommonHeaders(&request)
+        request.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")
+        return try await performAuthorized(request)
     }
 
     // MARK: Стрим ответа
@@ -795,7 +881,7 @@ public actor APIClient {
     public func sendMessage(_ text: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         // Публичный поток отдаёт только публичные события: подтверждение приёма — внутреннее
         // (см. `StreamAcceptance`), и хост, разбирающий поток сам, о нём знать не должен.
-        stream(text: text, clientMessageId: nil) { event in
+        stream(text: text, clientMessageId: nil, uploadIds: []) { event in
             guard case let .event(published) = event else { return nil }
             return published
         }
@@ -807,19 +893,29 @@ public actor APIClient {
     /// `replayed: true` и уже сохранённый ответ. Поток несёт ещё и `.accepted` — момент, когда
     /// сервер подтвердил приём; с этого момента «Повторить» безопасно, а сообщение не потеряно,
     /// даже если соединение оборвётся сразу после.
-    func sendMessage(_ text: String, clientMessageId: String?) -> AsyncThrowingStream<StreamEvent, Error> {
-        stream(text: text, clientMessageId: clientMessageId) { $0 }
+    func sendMessage(
+        _ text: String,
+        clientMessageId: String?,
+        uploadIds: [String] = []
+    ) -> AsyncThrowingStream<StreamEvent, Error> {
+        stream(text: text, clientMessageId: clientMessageId, uploadIds: uploadIds) { $0 }
     }
 
     private func stream<Element: Sendable>(
         text: String,
         clientMessageId: String?,
+        uploadIds: [String],
         map: @escaping @Sendable (StreamEvent) -> Element?
     ) -> AsyncThrowingStream<Element, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await runStream(text: text, clientMessageId: clientMessageId, allowRetry: true) { event in
+                    try await runStream(
+                        text: text,
+                        clientMessageId: clientMessageId,
+                        uploadIds: uploadIds,
+                        allowRetry: true
+                    ) { event in
                         if let element = map(event) { continuation.yield(element) }
                     }
                     continuation.finish()
@@ -836,6 +932,7 @@ public actor APIClient {
     private func runStream(
         text: String,
         clientMessageId: String?,
+        uploadIds: [String],
         allowRetry: Bool,
         allowUnavailableRetry: Bool = true,
         yield: (StreamEvent) -> Void
@@ -843,9 +940,11 @@ public actor APIClient {
         var request = makeRequest(path: "/api/v1/mobile/chat/stream", method: "POST")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")
-        // Тело — текст и идентификатор отправки: диалог выбирает сервер по устройству из токена.
+        // Тело — текст, идентификатор отправки и id загруженных вложений: диалог выбирает сервер
+        // по устройству из токена. `message` может быть пустым, если есть `uploadIds`.
         var body: [String: Any] = ["message": text]
         if let clientMessageId { body["clientMessageId"] = clientMessageId }
+        if !uploadIds.isEmpty { body["uploadIds"] = uploadIds }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (bytes, response): (URLSession.AsyncBytes, URLResponse)
@@ -866,11 +965,13 @@ public actor APIClient {
             // другого канала, и перевыпуск его не исправит.
             if Self.isRecoverableBySession(status: http.statusCode, code: error.code), allowRetry {
                 invalidateToken()
-                // Повтор несёт ТОТ ЖЕ `clientMessageId`: иначе перерегистрация превратила бы
-                // одну отправку в два сообщения в треде и два платных ответа модели.
+                // Повтор несёт ТОТ ЖЕ `clientMessageId` и те же `uploadIds`: иначе
+                // перерегистрация превратила бы одну отправку в два сообщения в треде и два
+                // платных ответа модели.
                 try await runStream(
                     text: text,
                     clientMessageId: clientMessageId,
+                    uploadIds: uploadIds,
                     allowRetry: false,
                     allowUnavailableRetry: allowUnavailableRetry,
                     yield: yield
@@ -884,6 +985,7 @@ public actor APIClient {
                 try await runStream(
                     text: text,
                     clientMessageId: clientMessageId,
+                    uploadIds: uploadIds,
                     allowRetry: allowRetry,
                     allowUnavailableRetry: false,
                     yield: yield

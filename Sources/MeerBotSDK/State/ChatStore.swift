@@ -12,6 +12,100 @@ public enum ChatMode: String, Codable, Sendable {
     case closed
 }
 
+/// Вид вложения. Совпадает с `QuickReplyMediaKind` бэкенда (`image | video | audio |
+/// document`) и с классификацией на Android. Клиент выводит его из mime САМ только для
+/// оптимистичной плашки исходящего файла — окончательный вид приходит с сервера.
+public enum AttachmentKind {
+    /// Из mime-типа, как `classifyMediaKind` на бэкенде: всё, что не image/video/audio, —
+    /// документ. Значение — строка (`ChatMessage`/`Attachment` держат его строкой ради
+    /// паритета формата с сервером, где это тоже строка).
+    public static func classify(_ mime: String) -> String {
+        let m = mime.lowercased()
+        if m.hasPrefix("image/") { return "image" }
+        if m.hasPrefix("video/") { return "video" }
+        if m.hasPrefix("audio/") { return "audio" }
+        return "document"
+    }
+}
+
+/// Вложение сообщения — как его отдаёт бэкенд (без `r2Key`). Раздача картинки:
+/// `GET /api/v1/mobile/media/<messageId>/<mediaId>` с `Authorization: Bearer <JWT>`,
+/// где `messageId` — серверный id несущего сообщения (`ChatMessage.serverId`).
+///
+/// `mediaId` пуст у ЛОКАЛЬНОГО превью (файл выбран, но ещё не загружен): такое вложение
+/// рисуется плашкой, а не картинкой, пока догон истории не принесёт серверную версию.
+public struct Attachment: Identifiable, Equatable, Sendable {
+    /// Стабильный ключ для SwiftUI. У серверного вложения — это `mediaId`; у локального
+    /// превью (mediaId пуст) — свой UUID, иначе два неотправленных файла схлопнулись бы в один.
+    public let id: String
+    public let mediaId: String
+    /// `image | video | audio | document`.
+    public let kind: String
+    public let mime: String
+    public let fileName: String?
+    public let size: Int
+    public let width: Int?
+    public let height: Int?
+    public let duration: Int?
+
+    public init(
+        mediaId: String,
+        kind: String,
+        mime: String,
+        fileName: String?,
+        size: Int,
+        width: Int? = nil,
+        height: Int? = nil,
+        duration: Int? = nil,
+        id: String? = nil
+    ) {
+        self.mediaId = mediaId
+        self.id = id ?? (mediaId.isEmpty ? UUID().uuidString : mediaId)
+        self.kind = kind
+        self.mime = mime
+        self.fileName = fileName
+        self.size = size
+        self.width = width
+        self.height = height
+        self.duration = duration
+    }
+
+    /// Разбор массива вложений из ответа сервера (история и `manager_message`). Запись без
+    /// `mediaId` (строкой) пропускается: без него картинку не раздать. Форма и имена полей —
+    /// `WidgetAttachmentDTO` бэкенда, паритет с Android.
+    static func parse(_ raw: [[String: Any]]) -> [Attachment] {
+        raw.compactMap { item in
+            guard let mediaId = item["mediaId"] as? String, !mediaId.isEmpty else { return nil }
+            return Attachment(
+                mediaId: mediaId,
+                kind: (item["kind"] as? String) ?? AttachmentKind.classify(item["mime"] as? String ?? ""),
+                mime: (item["mime"] as? String) ?? "application/octet-stream",
+                fileName: item["fileName"] as? String,
+                size: (item["size"] as? Int) ?? 0,
+                width: item["width"] as? Int,
+                height: item["height"] as? Int,
+                duration: item["duration"] as? Int
+            )
+        }
+    }
+}
+
+/// Файл, выбранный пользователем и готовый к загрузке (`POST /mobile/upload`). Без UIKit —
+/// чтобы `ChatController` компилировался на macOS-хосте CI; сам выбор файла живёт в
+/// `AttachmentPicker` под `#if canImport(UIKit)`.
+public struct OutgoingAttachment: Sendable, Equatable {
+    public let data: Data
+    public let fileName: String
+    public let mime: String
+    public var kind: String { AttachmentKind.classify(mime) }
+
+    public init(data: Data, fileName: String, mime: String) {
+        self.data = data
+        self.fileName = fileName
+        self.mime = mime
+    }
+}
+
 public struct ChatMessage: Identifiable, Equatable, Sendable {
     public let id: String
     /// id строки на сервере — ключ слияния при догоне ленты.
@@ -28,6 +122,9 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
     /// Сообщение не доставлено (обрыв сети при отправке) — UI показывает возможность повтора.
     public var failed: Bool
     public let timestamp: Date
+    /// Вложения сообщения. У исходящего — сперва локальные превью (mediaId пуст), затем
+    /// серверные (их проставляет слияние истории). У входящего/менеджерского — серверные.
+    public var attachments: [Attachment]
 
     public init(
         id: String = UUID().uuidString,
@@ -38,7 +135,8 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
         content: String,
         streaming: Bool = false,
         failed: Bool = false,
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        attachments: [Attachment] = []
     ) {
         self.id = id
         self.serverId = serverId
@@ -49,6 +147,7 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
         self.streaming = streaming
         self.failed = failed
         self.timestamp = timestamp
+        self.attachments = attachments
     }
 }
 
@@ -139,8 +238,8 @@ public final class ChatStore: ObservableObject {
     public func setGreeting(_ text: String?) { greeting = text }
 
     @discardableResult
-    public func appendUserMessage(_ content: String) -> ChatMessage {
-        appendLocal(ChatMessage(role: "user", content: content))
+    public func appendUserMessage(_ content: String, attachments: [Attachment] = []) -> ChatMessage {
+        appendLocal(ChatMessage(role: "user", content: content, attachments: attachments))
     }
 
     @discardableResult
@@ -178,13 +277,23 @@ public final class ChatStore: ObservableObject {
         }
     }
 
-    public func appendOperatorMessage(content: String, authorName: String?) {
+    public func appendOperatorMessage(
+        content: String,
+        authorName: String?,
+        serverId: Int? = nil,
+        attachments: [Attachment] = []
+    ) {
+        // serverId проставляется, когда его знает поток (`manager_message.messageId`): по нему
+        // догон истории узнаёт уже показанную строку и не кладёт её вторично (пропуск по
+        // `serverId` в `mergeServerMessages`). Без него та же строка приезжала бы дублем.
         _ = appendLocal(
             ChatMessage(
+                serverId: serverId,
                 role: "assistant",
                 author: "manager",
                 authorName: authorName,
-                content: content
+                content: content,
+                attachments: attachments
             )
         )
     }
@@ -263,6 +372,9 @@ public final class ChatStore: ObservableObject {
                         && $0.id.caseInsensitiveCompare(itemClientId) == .orderedSame
                 }) {
                     messages[localIdx].serverId = item.serverId
+                    // Серверные вложения замещают локальные превью (mediaId пуст): только теперь
+                    // у своего же файла есть mediaId, по которому его картинку можно раздать.
+                    if !item.attachments.isEmpty { messages[localIdx].attachments = item.attachments }
                     echoFloors[messages[localIdx].id] = nil
                     idConfirmed.insert(messages[localIdx].id)
                     recognized.insert(index)
@@ -289,6 +401,7 @@ public final class ChatStore: ObservableObject {
             }) {
                 messages[localIdx].serverId = item.serverId
                 messages[localIdx].failed = false
+                if !item.attachments.isEmpty { messages[localIdx].attachments = item.attachments }
                 echoFloors[messages[localIdx].id] = nil
                 recognized.insert(index)
             }

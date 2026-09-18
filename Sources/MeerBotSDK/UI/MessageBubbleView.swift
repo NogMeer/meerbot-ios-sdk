@@ -10,6 +10,15 @@ struct MessageBubbleView: View {
     /// только при ошибке связи, а недоставленным сообщение остаётся и после закрытия экрана
     /// посреди отправки, когда никакой ошибки не было.
     var onRetry: (() -> Void)?
+    /// Загрузчик картинок вложений (проксирует к `ChatController.loadMedia`). Нужен инлайновой
+    /// картинке; плашке — нет.
+    var loadMedia: MediaLoader = { _, _ in throw MeerBotError.invalidResponse }
+
+    /// Показывать текстовый пузырь: у сообщения-картинки текст пуст, и пустой пузырь под ней
+    /// был бы лишним прямоугольником.
+    private var showsTextBubble: Bool {
+        message.streaming || !message.content.isEmpty || message.attachments.isEmpty
+    }
 
     var body: some View {
         HStack {
@@ -22,6 +31,45 @@ struct MessageBubbleView: View {
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
+                if showsTextBubble {
+                    textBubble
+                }
+                ForEach(message.attachments) { attachment in
+                    AttachmentContentView(
+                        messageId: message.serverId,
+                        attachment: attachment,
+                        tint: .accentColor,
+                        load: loadMedia
+                    )
+                    .opacity(message.failed ? 0.6 : 1)
+                }
+                if message.failed {
+                    if let onRetry {
+                        Button(action: onRetry) {
+                            Label("Не отправлено. Повторить", systemImage: "arrow.clockwise.circle")
+                                .font(.caption2)
+                                .foregroundColor(.red)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Повторить отправку")
+                    } else {
+                        Label("Не отправлено", systemImage: "exclamationmark.circle")
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                    }
+                }
+            }
+            if message.role != "user" {
+                Spacer(minLength: 40)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 2)
+        .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .opacity))
+    }
+
+    @ViewBuilder
+    private var textBubble: some View {
                 Group {
                     if message.streaming && message.content.isEmpty {
                         // Модель ещё думает — текста нет вовсе. Раньше здесь оставался
@@ -52,29 +100,6 @@ struct MessageBubbleView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .fixedSize(horizontal: false, vertical: true)
                 .opacity(message.failed ? 0.6 : 1)
-                if message.failed {
-                    if let onRetry {
-                        Button(action: onRetry) {
-                            Label("Не отправлено. Повторить", systemImage: "arrow.clockwise.circle")
-                                .font(.caption2)
-                                .foregroundColor(.red)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Повторить отправку")
-                    } else {
-                        Label("Не отправлено", systemImage: "exclamationmark.circle")
-                            .font(.caption2)
-                            .foregroundColor(.red)
-                    }
-                }
-            }
-            if message.role != "user" {
-                Spacer(minLength: 40)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 2)
-        .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .opacity))
     }
 
     private var bubbleBackground: Color {

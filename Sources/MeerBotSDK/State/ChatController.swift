@@ -51,7 +51,10 @@ public final class ChatController: ObservableObject {
     /// счётчик не ноль, сеть не трогаем: отправка ждёт в `queuedSend`, старт — в `finish`.
     private var pendingIdentityChanges = 0
     /// Сообщение, отправленное, пока применялась смена identity. Уходит сразу после неё.
-    private var queuedSend: (text: String, userMessageId: String)?
+    private var queuedSend: (text: String, userMessageId: String, uploadIds: [String])?
+    /// Файлы исходящих сообщений, ещё не загруженные или недогруженные (обрыв на upload).
+    /// Ключ — id локальной строки; по нему `retry(messageId:)` повторяет загрузку.
+    private var pendingUploads: [String: [OutgoingAttachment]] = [:]
     /// Фоновый догон остановлен: сессию не восстановила даже перерегистрация (`device_*`,
     /// `jwt_*` после повтора). Крутить его дальше — две регистрации и две истории каждые
     /// 12 секунд без шанса на успех. Снимается явным действием: показ экрана, отправка,
@@ -166,6 +169,36 @@ public final class ChatController: ObservableObject {
         run(text: trimmed, userMessageId: userMessage.id)
     }
 
+    /// Отправить сообщение с вложениями. Файлы сперва грузятся (`POST /mobile/upload`), затем
+    /// сообщение уходит с их `uploadIds`. Текст может быть пустым, если вложение есть.
+    ///
+    /// Порядок ради shadow-путей: оптимистичная строка появляется СРАЗУ (с локальными
+    /// превью-плашками), загрузка идёт следом. Сбой загрузки — строка помечается
+    /// недоставленной, текст НЕ теряется (лежит в строке), «Повторить» повторяет и загрузку.
+    public func send(_ text: String, attachments: [OutgoingAttachment]) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ≤10 — лишнее молча отсекаем на клиенте: сервер такой запрос всё равно отклонит.
+        let files = Array(attachments.prefix(APIClient.maxAttachments))
+        guard files.isEmpty == false else {
+            send(trimmed) // вложений не осталось — обычный текстовый путь
+            return
+        }
+        guard !store.sending, store.mode != .closed else { return }
+        retryableText = nil
+        let previews = files.map {
+            Attachment(mediaId: "", kind: $0.kind, mime: $0.mime, fileName: $0.fileName, size: $0.data.count)
+        }
+        let userMessage = store.appendUserMessage(trimmed, attachments: previews)
+        pendingUploads[userMessage.id] = files
+        runWithAttachments(text: trimmed, userMessageId: userMessage.id)
+    }
+
+    /// Скачать байты вложения для показа (картинка). Проксирует к клиенту, чтобы вью не знали
+    /// ни про baseURL, ни про токен.
+    public func loadMedia(messageId: Int, mediaId: String) async throws -> Data {
+        try await client.mediaData(messageId: messageId, mediaId: mediaId)
+    }
+
     /// Повторить последнюю неудачную отправку.
     ///
     /// Повторяется СТРОКА ленты, помеченная недоставленной, и её же текст. Нет такой строки —
@@ -193,7 +226,56 @@ public final class ChatController: ObservableObject {
         else { return }
         retryableText = nil
         store.setFailed(id: messageId, false)
-        run(text: message.content, userMessageId: messageId)
+        // Осталась незавершённая загрузка вложений — повторяем её, а не только отправку текста.
+        if pendingUploads[messageId] != nil {
+            runWithAttachments(text: message.content, userMessageId: messageId)
+        } else {
+            run(text: message.content, userMessageId: messageId)
+        }
+    }
+
+    /// Загрузить вложения строки и отправить сообщение с их `uploadIds`. Сбой загрузки не
+    /// теряет ни текст, ни файлы: строка остаётся недоставленной, `pendingUploads` — для повтора.
+    private func runWithAttachments(text: String, userMessageId: String) {
+        guard let files = pendingUploads[userMessageId], !files.isEmpty else {
+            pendingUploads[userMessageId] = nil
+            run(text: text, userMessageId: userMessageId)
+            return
+        }
+        // Ждёт применения смены identity — уйдёт (вместе с загрузкой) после неё.
+        if pendingIdentityChanges > 0 {
+            store.setError(nil)
+            store.setSending(true)
+            queuedSend = (text, userMessageId, [])
+            return
+        }
+        store.setError(nil)
+        store.setSending(true)
+        let epoch = identityEpoch
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                var uploadIds: [String] = []
+                for file in files {
+                    let result = try await self.client.uploadAttachment(
+                        data: file.data, fileName: file.fileName, mime: file.mime
+                    )
+                    guard self.identityEpoch == epoch else { return }
+                    uploadIds.append(result.uploadId)
+                }
+                guard self.identityEpoch == epoch else { return }
+                // Загрузка удалась — файлы больше не ждут повтора; уходит сама отправка.
+                self.pendingUploads[userMessageId] = nil
+                self.run(text: text, userMessageId: userMessageId, uploadIds: uploadIds)
+            } catch {
+                guard self.identityEpoch == epoch else { return }
+                // Файл не загрузился: сообщение недоставлено, текст и файлы остаются для повтора.
+                self.store.setSending(false)
+                self.store.setFailed(id: userMessageId, true)
+                self.store.setError(Self.message(for: error))
+                self.retryableText = text
+            }
+        }
     }
 
     /// Открыть диалог по deep link из пуша.
@@ -285,6 +367,8 @@ public final class ChatController: ObservableObject {
         // некому — прежнего пользователя на экране уже нет. Строку и `sending` снимает сброс
         // ленты ниже.
         queuedSend = nil
+        // Файлы прежнего человека не должны пережить смену: его лента стирается ниже.
+        pendingUploads.removeAll()
         store.resetForIdentityChange()
         isReady = false
         retryableText = nil
@@ -301,7 +385,13 @@ public final class ChatController: ObservableObject {
         if screenVisible { start() }
         if let queued = queuedSend {
             queuedSend = nil
-            run(text: queued.text, userMessageId: queued.userMessageId)
+            // Строку с ещё не загруженными файлами доводим через загрузку; остальные — обычным
+            // путём с уже полученными `uploadIds`.
+            if pendingUploads[queued.userMessageId] != nil {
+                runWithAttachments(text: queued.text, userMessageId: queued.userMessageId)
+            } else {
+                run(text: queued.text, userMessageId: queued.userMessageId, uploadIds: queued.uploadIds)
+            }
         }
     }
 
@@ -401,11 +491,11 @@ public final class ChatController: ObservableObject {
 
     // MARK: - Поток
 
-    private func run(text: String, userMessageId: String) {
+    private func run(text: String, userMessageId: String, uploadIds: [String] = []) {
         if pendingIdentityChanges > 0 {
             // Сообщение остаётся в ленте и уйдёт, как только смена identity применится
             // (`finishIdentityChange`); `sending` не даёт отправить второе поверх.
-            queuedSend = (text, userMessageId)
+            queuedSend = (text, userMessageId, uploadIds)
             store.setError(nil)
             store.setSending(true)
             return
@@ -427,7 +517,9 @@ public final class ChatController: ObservableObject {
             // завершённый поток от оборванного отменой.
             var serverFinished = false
             do {
-                for try await event in await self.client.sendMessage(text, clientMessageId: clientMessageId) {
+                for try await event in await self.client.sendMessage(
+                    text, clientMessageId: clientMessageId, uploadIds: uploadIds
+                ) {
                     // Смена identity отменяет задачу, но кадр, уже лежащий в буфере потока,
                     // мог бы дойти — в ленту нового пользователя.
                     guard self.identityEpoch == epoch else { return }
@@ -528,7 +620,12 @@ public final class ChatController: ObservableObject {
             return true
 
         case let .managerMessage(message):
-            store.appendOperatorMessage(content: message.text, authorName: message.authorName)
+            store.appendOperatorMessage(
+                content: message.text,
+                authorName: message.authorName,
+                serverId: message.messageId > 0 ? message.messageId : nil,
+                attachments: message.attachments
+            )
             store.setOperatorTyping(nil)
             return false
 
@@ -793,7 +890,8 @@ public final class ChatController: ObservableObject {
                 author: item.role == "assistant" ? (isManager ? "manager" : "ai") : nil,
                 authorName: isManager ? item.authorName : nil,
                 content: item.content,
-                timestamp: item.createdAt ?? Date()
+                timestamp: item.createdAt ?? Date(),
+                attachments: item.attachments
             )
         }
     }
