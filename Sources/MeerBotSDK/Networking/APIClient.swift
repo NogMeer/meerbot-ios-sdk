@@ -47,15 +47,25 @@ public struct MeerBotConfiguration {
     public let apiKey: String
     public let baseURL: URL
     public let sdkVersion: String
+    /// Версия хост-приложения для `device.appVersion` в `register`. `nil` — SDK берёт
+    /// `CFBundleShortVersionString` из `Bundle.main` сам (см. `DeviceContext`).
+    public let appVersion: String?
+    /// Сборка хост-приложения для `device.appBuild` в `register`. `nil` — SDK берёт
+    /// `CFBundleVersion` из `Bundle.main` сам (см. `DeviceContext`).
+    public let appBuild: String?
 
     public init(
         apiKey: String,
         baseURL: URL = URL(string: MeerBotPlatform.apiBaseUrl)!,
-        sdkVersion: String = MeerBotPlatform.version
+        sdkVersion: String = MeerBotPlatform.version,
+        appVersion: String? = nil,
+        appBuild: String? = nil
     ) {
         self.apiKey = apiKey
         self.baseURL = baseURL
         self.sdkVersion = sdkVersion
+        self.appVersion = appVersion
+        self.appBuild = appBuild
     }
 }
 
@@ -619,6 +629,11 @@ public actor APIClient {
         // Отдельное поле, а не `identityToken: null`: у сервера поле токена — строка, и
         // `null` вернул бы 400. Старый сервер незнакомое поле игнорирует.
         if logoutSent != nil { body["logout"] = true }
+        // Диагностический контекст — необязательный вложенный объект. Пустой (ничего не
+        // удалось собрать) в тело не кладём: сервер не должен отличать «device: {}» от
+        // отсутствия поля. Старый сервер незнакомый ключ игнорирует.
+        let device = DeviceContext.collect(config: config)
+        if !device.isEmpty { body["device"] = device }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data = try await perform(request, retryingUnavailable: true)

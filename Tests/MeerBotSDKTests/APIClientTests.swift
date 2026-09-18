@@ -204,6 +204,52 @@ final class APIClientTests: XCTestCase {
         XCTAssertNil(request.body?["identityToken"])
     }
 
+    // MARK: Device context
+
+    /// Хост переопределил версию/сборку — SDK не подставляет свои, а поле всё равно уходит
+    /// вложенным объектом, а не плоскими ключами в теле.
+    func testDeviceContextУходитСПереопределённымиВерсиейИСборкой() async throws {
+        stubRegister()
+        let client = APIClient(
+            config: MeerBotConfiguration(
+                apiKey: "pk_live_test",
+                baseURL: URL(string: "https://meerbot.test")!,
+                sdkVersion: "0.3.0",
+                appVersion: "9.9.9",
+                appBuild: "42"
+            ),
+            visitorUuid: visitorUuid,
+            installationId: installationId,
+            sessionConfiguration: .stubbed(),
+            flagStore: flagStore
+        )
+
+        _ = try await client.openSession()
+
+        let body = try XCTUnwrap(registerBodies().first)
+        let device = try XCTUnwrap(body["device"] as? [String: String], "device — вложенный объект")
+        XCTAssertEqual(device["appVersion"], "9.9.9")
+        XCTAssertEqual(device["appBuild"], "42")
+        // locale/timezone SDK собирает сам всегда — их наличие доказывает, что объект не
+        // ограничен только переопределёнными хостом полями.
+        XCTAssertNotNil(device["locale"])
+        XCTAssertNotNil(device["timezone"])
+    }
+
+    /// Без единого известного поля (нет ни переопределения, ни бандла хоста — тестовый ранер
+    /// не публикует `CFBundleShortVersionString`/`Version`) ключ `device` в тело не попадает:
+    /// сервер не должен отличать «device: {}» от отсутствия поля.
+    ///
+    /// `locale`/`timezone` при этом собираются ВСЕГДА (`Locale.current`/`TimeZone.current`
+    /// не бывают пустыми), поэтому пустым `device` не бывает на практике — тест фиксирует
+    /// контракт `DeviceContext.collect` напрямую, а не через сеть.
+    func testПустойDeviceContextНеДобавляетКлюч() {
+        let device = DeviceContext.collect(config: MeerBotConfiguration(apiKey: "pk_live_test"))
+        XCTAssertFalse(device.isEmpty, "locale/timezone собираются всегда")
+        XCTAssertNotNil(device["locale"])
+        XCTAssertNotNil(device["timezone"])
+    }
+
     // MARK: Выход
 
     /// Выход — отдельное поле, а не `identityToken: null`: у сервера токен — строка, и `null`

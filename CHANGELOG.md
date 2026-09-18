@@ -5,6 +5,24 @@
 До `1.0.0` минорная версия может нести ломающие изменения публичного API; правило подключения
 «Up to Next Minor» на этот период надёжнее, чем «Up to Next Major».
 
+## [0.3.0] — 2026-09-19
+
+### Добавлено
+- **Device-context в `register`.** Тело регистрации получило необязательный вложенный
+  объект `device`: `appVersion`/`appBuild` (хост может переопределить через
+  `MeerBotConfiguration.appVersion`/`.appBuild`, иначе SDK берёт `CFBundleShortVersionString`/
+  `CFBundleVersion` из `Bundle.main` сам), `model`/`osVersion` (`UIDevice.current` — на
+  macOS-сборке CI без симулятора `UIKit` недоступен, и эти два поля просто не собираются, см.
+  `Support/PlatformAppearance.swift`), `locale` (`Locale.current.identifier`) и `timezone`
+  (`TimeZone.current.identifier`). Каждое значение обрезается до 64 символов, пустое или
+  отсутствующее в тело не попадает; ключ `device` уходит только если собралось хоть одно
+  поле. Паритет с Android-срезом. Сервер старше этой правки незнакомый ключ игнорирует.
+
+### Совместимость
+- `MeerBotConfiguration.init` получил два новых опциональных параметра (`appVersion`,
+  `appBuild`) в конце списка со значением по умолчанию `nil` — существующие вызовы не
+  ломаются.
+
 ## [0.2.9] — 2026-09-13
 
 ### Исправлено
