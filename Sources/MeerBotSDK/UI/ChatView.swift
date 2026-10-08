@@ -61,7 +61,8 @@ public struct ChatView: View {
             MessagesList(
                 store: store,
                 onRetry: { controller.retry(messageId: $0) },
-                loadMedia: { try await controller.loadMedia(messageId: $0, mediaId: $1) }
+                loadMedia: { try await controller.loadMedia(messageId: $0, mediaId: $1) },
+                onLoadOlder: { controller.loadOlder() }
             )
                 // ТАП по переписке убирает клавиатуру. Протягивания
                 // (`scrollDismissesKeyboard`) недостаточно: оно требует, чтобы списку было
@@ -156,6 +157,15 @@ struct MessagesList: View {
     let onRetry: (String) -> Void
     /// Загрузчик картинок вложений — прокидывается в пузырь.
     let loadMedia: MediaLoader
+    /// Подгрузить страницу более старых сообщений (верх ленты стал виден).
+    let onLoadOlder: () -> Void
+
+    /// Верх ленты (строка статуса над первым сообщением) сейчас на экране.
+    @State private var topVisible = false
+    /// Первое сообщение ДО подгрузки старых: после вставки сверху прокрутка возвращается к
+    /// нему — SwiftUI держит смещение в точках, а не сообщение, и без этого лента прыгала бы
+    /// к самым старым.
+    @State private var olderAnchorId: String?
 
     /// Первая порция истории уже показана? До неё прыжок вниз делается БЕЗ анимации.
     ///
@@ -194,17 +204,48 @@ struct MessagesList: View {
             MessagesFeed(
                 messages: store.messages,
                 greeting: store.greeting,
+                older: OlderHistoryState(
+                    hasOlder: store.hasOlder,
+                    loading: store.loadingOlder,
+                    failed: store.olderFailed
+                ),
                 onRetry: onRetry,
-                loadMedia: loadMedia
+                loadMedia: loadMedia,
+                onTopVisible: { visible in
+                    topVisible = visible
+                    if visible { requestOlder() }
+                },
+                onRetryOlder: { requestOlder(force: true) }
             )
             .equatable()
+        }
+        // Старые сообщения встали сверху — вернуть на экран то, что пользователь видел.
+        .onChange(of: store.messages.first?.id) { first in
+            guard let anchor = olderAnchorId, first != anchor else { return }
+            olderAnchorId = nil
+            proxy.scrollTo(anchor, anchor: .top)
+            // Второй проход после кадра: ячейки над якорем материализуются лениво.
+            DispatchQueue.main.async { proxy.scrollTo(anchor, anchor: .top) }
+        }
+        // Первый доскролл вниз состоялся, а верх всё ещё виден (хвост короче экрана) —
+        // onAppear строки статуса уже отработал до доскролла и сам не повторится.
+        .onChange(of: didInitialScroll) { done in
+            if done, topVisible { requestOlder() }
+        }
+        // Страница пришла, а верх всё ещё виден (лента короче экрана) — грузим следующую.
+        .onChange(of: store.loadingOlder) { loading in
+            guard !loading else { return }
+            if store.messages.first?.id == olderAnchorId { olderAnchorId = nil }
+            if topVisible { requestOlder() }
         }
         // Открытие экрана. Одного `onChange` мало: `ChatStore` живёт в синглтоне
         // `MeerBot.shared` и переживает закрытие чата, поэтому при ПОВТОРНОМ открытии
         // список уже непустой, `messages.count` не меняется — и `onChange` не срабатывает
         // вовсе. Без этой ветки второй заход в чат всегда открывался сверху.
         .onAppear { jumpToBottom(proxy, animated: false) }
-        .onChange(of: store.messages.count) { _ in
+        // Ключ — ПОСЛЕДНЕЕ сообщение, а не их число: подгрузка старых сверху меняет число,
+        // но не должна сбрасывать читающего историю вниз.
+        .onChange(of: store.messages.last?.id) { _ in
             // Первый приход истории — мгновенно (экран должен ОТКРЫТЬСЯ внизу, а не
             // доехать туда); дальше новые сообщения — с анимацией, как в мессенджерах.
             jumpToBottom(proxy, animated: didInitialScroll)
@@ -242,6 +283,15 @@ struct MessagesList: View {
         #endif
     }
 
+    /// Запросить старые. До первого доскролла вниз не грузим: на открытии верх виден всегда.
+    /// После ошибки — только по «Повторить» (`force`), автоповтора нет.
+    private func requestOlder(force: Bool = false) {
+        guard didInitialScroll, store.hasOlder, !store.loadingOlder else { return }
+        guard force || !store.olderFailed else { return }
+        olderAnchorId = store.messages.first?.id
+        onLoadOlder()
+    }
+
     private func jumpToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
         guard let last = store.messages.last else { return }
         didInitialScroll = true
@@ -266,9 +316,15 @@ struct MessagesList: View {
 struct MessagesFeed: View, Equatable {
     let messages: [ChatMessage]
     let greeting: String?
+    /// Состояние подгрузки старых — строка статуса над первым сообщением.
+    let older: OlderHistoryState
     let onRetry: (String) -> Void
     /// Загрузчик картинок вложений. В сравнение не входит (замыкание), как и `onRetry`.
     let loadMedia: MediaLoader
+    /// Верх ленты появился (`true`) / ушёл (`false`) с экрана. Замыкание — вне сравнения.
+    let onTopVisible: (Bool) -> Void
+    /// «Повторить» после ошибки подгрузки старых. Замыкание — вне сравнения.
+    let onRetryOlder: () -> Void
 
     /// Сравнение — по данным ленты; замыкание повтора в него не входит (оно пересоздаётся на
     /// каждом кадре и сравнимым не бывает, а зовёт одно и то же).
@@ -277,7 +333,7 @@ struct MessagesFeed: View, Equatable {
     /// удобно. Без этого strict-concurrency видит обращение к `@MainActor`-состоянию из
     /// неизолированного контекста.
     nonisolated static func == (lhs: MessagesFeed, rhs: MessagesFeed) -> Bool {
-        lhs.messages == rhs.messages && lhs.greeting == rhs.greeting
+        lhs.messages == rhs.messages && lhs.greeting == rhs.greeting && lhs.older == rhs.older
     }
 
     var body: some View {
@@ -295,6 +351,13 @@ struct MessagesFeed: View, Equatable {
                 .padding(.horizontal, 24)
                 .padding(.top, 40)
             } else {
+                // Строка ВНУТРИ ленивого стека: её onAppear/onDisappear срабатывают по
+                // видимости при прокрутке — это и есть сигнал «докрутили до начала».
+                if older.hasOlder || older.failed {
+                    OlderHistoryRow(state: older, onRetry: onRetryOlder)
+                        .onAppear { onTopVisible(true) }
+                        .onDisappear { onTopVisible(false) }
+                }
                 ForEach(messages) { msg in
                     MessageBubbleView(
                         message: msg,
@@ -306,6 +369,36 @@ struct MessagesFeed: View, Equatable {
                 }
             }
         }
+    }
+}
+
+struct OlderHistoryState: Equatable {
+    let hasOlder: Bool
+    let loading: Bool
+    let failed: Bool
+}
+
+/// Статус подгрузки старых над первым сообщением: спиннер, ошибка с «Повторить» или пусто.
+struct OlderHistoryRow: View {
+    let state: OlderHistoryState
+    let onRetry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if state.loading {
+                ProgressView()
+                Text("Загружаем предыдущие сообщения…")
+            } else if state.failed {
+                Text("Не удалось загрузить предыдущие сообщения.")
+                Button("Повторить", action: onRetry)
+            }
+        }
+        .font(.footnote)
+        .foregroundColor(.secondary)
+        // Пустая строка всё равно занимает высоту: иначе ленивому стеку нечего показывать,
+        // и onAppear не срабатывает.
+        .frame(maxWidth: .infinity, minHeight: 28)
+        .padding(.vertical, 4)
     }
 }
 

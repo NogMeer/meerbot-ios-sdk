@@ -164,6 +164,12 @@ public final class ChatStore: ObservableObject {
     @Published public private(set) var greeting: String? = nil
     /// Наибольший серверный id в ленте — курсор догона (`GET /mobile/messages?since=`).
     @Published public private(set) var lastServerMessageId: Int = 0
+    /// Выше загруженного есть более старые сообщения — экран подгружает их прокруткой вверх.
+    @Published public private(set) var hasOlder: Bool = false
+    /// Идёт подгрузка более старых сообщений.
+    @Published public private(set) var loadingOlder: Bool = false
+    /// Последняя подгрузка старых упала — экран показывает «Повторить», автоповтора нет.
+    @Published public private(set) var olderFailed: Bool = false
 
     /// Курсор на момент появления локальной строки: её эхо на сервере обязано быть НОВЕЕ.
     ///
@@ -223,6 +229,16 @@ public final class ChatStore: ObservableObject {
     public func clearDraft() { draft = "" }
 
     public func setMode(_ newMode: ChatMode) { mode = newMode }
+
+    func setHasOlder(_ value: Bool) { hasOlder = value }
+
+    func setLoadingOlder(_ loading: Bool, failed: Bool = false) {
+        loadingOlder = loading
+        olderFailed = failed
+    }
+
+    /// Самый старый серверный id в ленте — курсор `before` для подгрузки старых.
+    var oldestServerMessageId: Int? { messages.compactMap(\.serverId).min() }
 
     public func setOperatorTyping(_ name: String?) { operatorTyping = name }
 
@@ -497,6 +513,7 @@ public final class ChatStore: ObservableObject {
         sending = false
         connectionError = nil
         lastServerMessageId = 0
+        resetOlderPaging()
     }
 
     /// Сервер выдал устройству ДРУГУЮ строку (прежнюю увели в отставку): у неё свой диалог,
@@ -513,5 +530,13 @@ public final class ChatStore: ObservableObject {
         mode = .ai
         operatorTyping = nil
         lastServerMessageId = 0
+        // Старые страницы считались от треда прежней строки — заново их скажет хвост.
+        resetOlderPaging()
+    }
+
+    private func resetOlderPaging() {
+        hasOlder = false
+        loadingOlder = false
+        olderFailed = false
     }
 }

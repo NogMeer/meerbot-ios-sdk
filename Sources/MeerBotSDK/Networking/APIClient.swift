@@ -739,13 +739,15 @@ public actor APIClient {
 
     // MARK: История (догон после обрыва)
 
-    /// История диалога. Без `since` возвращает последние `limit` сообщений треда — именно
-    /// это нужно для замены ленты после обрыва. `since` — инкрементальный догон.
+    /// История диалога. Без курсоров возвращает последние `limit` сообщений треда — именно
+    /// это нужно для замены ленты после обрыва. `since` — инкрементальный догон, `before` —
+    /// страница старее курсора (подгрузка при прокрутке вверх). Курсоры взаимоисключающие.
     ///
     /// `conversationId` не передаётся: тред резолвится по устройству из токена. До первого
     /// сообщения пользователя диалога ещё нет — сервер отвечает пустой лентой, а не ошибкой.
     @discardableResult
-    public func history(since: Int? = nil, limit: Int = 50) async throws -> HistoryPage {
+    public func history(since: Int? = nil, before: Int? = nil, limit: Int = 50) async throws -> HistoryPage {
+        precondition(since == nil || before == nil, "since и before взаимоисключающие")
         var components = URLComponents(
             url: config.baseURL.appendingPathComponent("/api/v1/mobile/messages"),
             resolvingAgainstBaseURL: false
@@ -753,6 +755,9 @@ public actor APIClient {
         var query = [URLQueryItem(name: "limit", value: String(limit))]
         if let since {
             query.append(URLQueryItem(name: "since", value: String(since)))
+        }
+        if let before {
+            query.append(URLQueryItem(name: "before", value: String(before)))
         }
         components?.queryItems = query
         guard let url = components?.url else { throw MeerBotError.invalidResponse }
@@ -794,7 +799,8 @@ public actor APIClient {
                 attachments: (item["attachments"] as? [[String: Any]]).map(Attachment.parse) ?? []
             )
         }
-        if let last = messages.last?.id { lastMessageId = last }
+        // Страница старых (`before`) курсор догона не двигает: он — самое новое сообщение.
+        if before == nil, let last = messages.last?.id { lastMessageId = last }
 
         return HistoryPage(
             messages: messages,

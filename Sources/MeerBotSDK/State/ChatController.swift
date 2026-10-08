@@ -73,6 +73,10 @@ public final class ChatController: ObservableObject {
     /// Потолок страниц за один догон: сервер отдаёт `hasMore`, но цикл не имеет права стать
     /// бесконечным — при расхождении курсора он выжег бы батарею молча.
     private static let maxCatchUpPages = 5
+    /// Стартовый хвост ленты: экран открывается с последними сообщениями, а не ждёт всю
+    /// переписку. Остальное — страницами `olderPageLimit` при прокрутке вверх.
+    static let initialHistoryLimit = 3
+    static let olderPageLimit = 20
 
     public init(client: APIClient) {
         self.client = client
@@ -148,7 +152,7 @@ public final class ChatController: ObservableObject {
                 // регистрация про существование диалога ничего не сообщает. Пустая лента —
                 // штатный ответ, а не ошибка. Оттуда же приходит режим: кто отвечает
                 // пользователю (`ai` | `human`), знает только серверная строка диалога.
-                try? await self.loadHistory()
+                try? await self.loadHistory(limit: Self.initialHistoryLimit)
                 guard self.identityEpoch == epoch else { return }
                 self.isReady = true
                 self.startPolling()
@@ -461,6 +465,12 @@ public final class ChatController: ObservableObject {
                 }
                 store.setMode(page.mode)
                 mergeServerPage(page)
+                // Без курсора сервер отдал хвост: `hasMore` значит «выше есть старее», а не
+                // «догоняй дальше» — новее хвоста ничего нет, а старое подгрузит прокрутка.
+                if cursor <= 0 {
+                    store.setHasOlder(page.hasMore)
+                    break
+                }
                 if !page.hasMore { break }
             }
             // Баннер снимаем только если повторять нечего: иначе с экрана исчезла бы кнопка
@@ -838,9 +848,9 @@ public final class ChatController: ObservableObject {
     /// Режим применяется ДАЖЕ при пустой ленте: «диалог у менеджера» — это состояние треда,
     /// а не свойство сообщений, и пропусти мы его, экран предлагал бы писать боту, который
     /// в этом режиме молчит.
-    private func loadHistory() async throws {
+    private func loadHistory(limit: Int = 50) async throws {
         let epoch = identityEpoch
-        let page = try await client.history()
+        let page = try await client.history(limit: limit)
         guard identityEpoch == epoch else { return }
         // Страница прочитана уже ПОСЛЕ регистрации, то есть новой строкой устройства: сброс
         // ленты перед слиянием безопасен, полную историю можно вливать сразу.
@@ -848,6 +858,37 @@ public final class ChatController: ObservableObject {
         guard identityEpoch == epoch else { return }
         store.setMode(page.mode)
         mergeServerPage(page)
+        // Хвост без курсора: `hasMore` — «выше есть старее».
+        store.setHasOlder(page.hasMore)
+    }
+
+    /// Подгрузить страницу более старых сообщений — экран зовёт, когда пользователь докрутил
+    /// до начала ленты. Курсор догона не трогает: страница старее всего, что уже в ленте.
+    /// Ошибка не роняет экран — ставит `olderFailed`, и экран предлагает «Повторить».
+    public func loadOlder() {
+        guard isReady, store.hasOlder, !store.loadingOlder,
+              let before = store.oldestServerMessageId else { return }
+        let epoch = identityEpoch
+        let devices = seenDeviceChanges
+        store.setLoadingOlder(true)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let page = try await self.client.history(before: before, limit: Self.olderPageLimit)
+                // Сменился пользователь или строка устройства — страница от чужого треда.
+                let changes = await self.client.deviceChanges
+                guard self.identityEpoch == epoch, changes == devices else {
+                    self.store.setLoadingOlder(false)
+                    return
+                }
+                self.mergeServerPage(page)
+                self.store.setHasOlder(page.hasMore)
+                self.store.setLoadingOlder(false)
+            } catch {
+                guard self.identityEpoch == epoch else { return }
+                self.store.setLoadingOlder(false, failed: true)
+            }
+        }
     }
 
     /// Сервер дописал ответ на прерванную отправку: сообщение получило серверный id, и после

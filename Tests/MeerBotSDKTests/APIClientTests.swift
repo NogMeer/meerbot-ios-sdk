@@ -725,6 +725,26 @@ final class APIClientTests: XCTestCase {
 
     // MARK: История
 
+    func testСтраницаСтарыхПоBeforeНеДвигаетКурсорДогона() async throws {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json(["messages": [["id": 20, "role": "user", "content": "новое", "createdAt": "2026-08-15T10:00:00.000Z"]], "hasMore": true, "mode": "ai"]),
+            .json(["messages": [["id": 5, "role": "user", "content": "старое", "createdAt": "2026-08-14T10:00:00.000Z"]], "hasMore": false, "mode": "ai"])
+        )
+        let client = makeClient()
+
+        try await client.history(limit: 3)
+        let older = try await client.history(before: 20, limit: 20)
+
+        XCTAssertEqual(older.messages.map(\.id), [5])
+        let cursor = await client.lastMessageId
+        XCTAssertEqual(cursor, 20, "курсор догона — самое новое, а не последняя прочитанная страница")
+        let query = StubURLProtocol.requests(path: messagesPath).last?.url.query ?? ""
+        XCTAssertTrue(query.contains("before=20"), query)
+        XCTAssertFalse(query.contains("since="), query)
+    }
+
     func testДогонИсторииИдётБезIdДиалога() async throws {
         stubRegister()
         StubURLProtocol.enqueue(

@@ -102,6 +102,80 @@ final class ChatControllerTests: XCTestCase {
 
     /// «Диалог у менеджера» — состояние ТРЕДА, а не свойство сообщений. Не примени мы режим
     /// при пустой ленте, экран предлагал бы писать боту, который в этом режиме молчит.
+    private func row(_ id: Int) -> [String: Any] {
+        ["id": id, "role": "assistant", "content": "m\(id)", "authorKind": "ai", "createdAt": "2026-08-15T10:00:00.000Z"]
+    }
+
+    /// Старт с хвостом [8, 9, 10] и `hasMore`. Ответ подгрузки ставится в очередь СРАЗУ: стенд
+    /// повторяет последний ответ очереди, и добавленный позже встал бы за хвостом.
+    private func startedWithTail(then next: StubResponse) async throws -> ChatController {
+        stubRegister()
+        StubURLProtocol.enqueue(
+            path: messagesPath,
+            .json(["messages": [row(8), row(9), row(10)], "hasMore": true, "mode": "ai"]),
+            next
+        )
+        let controller = makeController()
+        addTeardownBlock { @MainActor in controller.stop() }
+        controller.start()
+        try await waitUntil("готовности сессии") { controller.isReady }
+        return controller
+    }
+
+    private var olderQueries: [String] {
+        StubURLProtocol.requests(path: messagesPath).map { $0.url.query ?? "" }.filter { $0.contains("before=") }
+    }
+
+    func testСтартГрузитТолькоХвостИзТрёхСообщений() async throws {
+        let controller = try await startedWithTail(then: .json(["messages": [], "hasMore": false, "mode": "ai"]))
+
+        XCTAssertTrue(controller.store.hasOlder, "hasMore хвоста — «выше есть старее»")
+        let query = StubURLProtocol.requests(path: messagesPath).first?.url.query ?? ""
+        XCTAssertTrue(query.contains("limit=\(ChatController.initialHistoryLimit)"), query)
+        XCTAssertFalse(query.contains("since=") || query.contains("before="), query)
+    }
+
+    func testПодгрузкаСтарыхСтавитСтраницуНадЛентойИНеДвигаетКурсор() async throws {
+        let controller = try await startedWithTail(
+            then: .json(["messages": [row(6), row(7)], "hasMore": false, "mode": "ai"])
+        )
+
+        controller.loadOlder()
+        try await waitUntil("страницы старых") { controller.store.messages.count == 5 && !controller.store.loadingOlder }
+
+        XCTAssertEqual(controller.store.messages.compactMap(\.serverId), [6, 7, 8, 9, 10])
+        XCTAssertEqual(controller.store.lastServerMessageId, 10)
+        XCTAssertFalse(controller.store.hasOlder)
+        XCTAssertEqual(olderQueries.count, 1)
+        XCTAssertTrue(olderQueries[0].contains("before=8"), olderQueries[0])
+        XCTAssertTrue(olderQueries[0].contains("limit=\(ChatController.olderPageLimit)"), olderQueries[0])
+    }
+
+    func testОшибкаПодгрузкиСтарыхВиднаЭкрануИНеТрогаетЛенту() async throws {
+        let controller = try await startedWithTail(then: .json([:], status: 500))
+
+        controller.loadOlder()
+        try await waitUntil("ошибки подгрузки") { controller.store.olderFailed }
+
+        XCTAssertFalse(controller.store.loadingOlder)
+        XCTAssertTrue(controller.store.hasOlder)
+        XCTAssertEqual(controller.store.messages.compactMap(\.serverId), [8, 9, 10])
+    }
+
+    func testБезСтарыхСообщенийПодгрузкаВСетьНеХодит() async throws {
+        stubRegister()
+        stubHistory([row(8)])
+        let controller = makeController()
+        addTeardownBlock { @MainActor in controller.stop() }
+        controller.start()
+        try await waitUntil("готовности сессии") { controller.isReady }
+
+        controller.loadOlder()
+
+        XCTAssertFalse(controller.store.loadingOlder)
+        XCTAssertTrue(olderQueries.isEmpty, "\(olderQueries)")
+    }
+
     func testРежимТредаПрименяетсяДажеПриПустойЛенте() async throws {
         stubRegister()
         stubHistory([], mode: "human")
